@@ -1,0 +1,18 @@
+[project]
+name = "face-similarity-api"
+version = "0.1.0"
+description = "Stateless FastAPI service that scores face similarity between reference photos and a recorded video"
+requires-python = ">=3.10,<3.13"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["B008"]  # FastAPI uses callables in argument defaults on purpose.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]

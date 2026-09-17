@@ -1,0 +1,11 @@
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.32,<1.0
+python-multipart>=0.0.12
+pydantic>=2.9,<3.0
+pydantic-settings>=2.6,<3.0
+anyio>=4.4
+
+numpy>=1.26,<2.3
+opencv-python-headless>=4.10,<5.0
+onnxruntime>=1.19,<2.0
+insightface==0.7.3

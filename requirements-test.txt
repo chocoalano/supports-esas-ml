@@ -1,0 +1,13 @@
+# Light dependency set for CI: the suite fakes the face engine, so the ~300 MB
+# of ONNX weights (onnxruntime + insightface) are not needed to run it.
+fastapi>=0.115,<1.0
+python-multipart>=0.0.12
+pydantic>=2.9,<3.0
+pydantic-settings>=2.6,<3.0
+anyio>=4.4
+numpy>=1.26
+opencv-python-headless>=4.10,<6.0
+
+pytest>=8.3
+httpx>=0.27
+ruff>=0.6

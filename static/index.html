@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Face Similarity API — Demo</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#0f1115; --fg:#e7e9ee; --muted:#9aa3b2; --card:#171a21; --line:#262b36; --ok:#2fbf71; --bad:#e5484d; --warn:#e0a30c; --accent:#2f6feb; }
+    @media (prefers-color-scheme: light) { :root { --bg:#f6f7f9; --fg:#12151c; --muted:#5b6472; --card:#fff; --line:#e2e5ea; } }
+    * { box-sizing: border-box; }
+    body { margin:0; padding:24px; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+    main { max-width: 960px; margin: 0 auto; display:grid; gap:16px; }
+    h1 { font-size:20px; margin:0; }
+    p.sub { margin:0; color:var(--muted); }
+    section { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; }
+    h2 { font-size:14px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:0 0 12px; }
+    video { width:100%; max-width:420px; border-radius:10px; background:#000; aspect-ratio:4/3; object-fit:cover; }
+    button { font:inherit; padding:9px 16px; border-radius:8px; border:1px solid var(--line); background:var(--accent); color:#fff; cursor:pointer; }
+    button.secondary { background:transparent; color:var(--fg); }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:12px; }
+    .thumbs { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+    .thumbs img { width:72px; height:72px; object-fit:cover; border-radius:8px; border:1px solid var(--line); }
+    ol.actions { margin:12px 0 0; padding-left:20px; }
+    ol.actions li { margin:4px 0; }
+    ol.actions li.active { color:var(--accent); font-weight:600; }
+    ol.actions li.done { color:var(--ok); }
+    .cue { font-size:19px; font-weight:600; min-height:28px; margin-top:12px; }
+    .verdict { font-size:22px; font-weight:600; }
+    .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)}
+    .bar { height:8px; border-radius:99px; background:var(--line); overflow:hidden; margin:10px 0 4px; }
+    .bar > i { display:block; height:100%; background:var(--ok); }
+    pre { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:12px; overflow:auto; max-height:340px; font-size:12px; }
+    small { color:var(--muted); }
+    .pill { display:inline-block; padding:2px 8px; border-radius:99px; border:1px solid var(--line); font-size:12px; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Face Similarity API — Demo</h1>
+    <p class="sub">Pilih 5 foto referensi, ambil tantangan liveness (opsional), rekam video, lalu bandingkan. Tidak ada data yang disimpan.</p>
+  </header>
+
+  <section>
+    <h2>0. Kunci API</h2>
+    <p class="sub">Servis ini menolak permintaan tanpa kunci, kecuali dijalankan dengan
+      <code>FSA_DEBUG=true</code>. Kunci disimpan di browser ini saja dan tidak dikirim ke mana pun
+      selain servisnya.</p>
+    <input id="apiKey" type="password" placeholder="isi salah satu nilai dari FSA_API_KEYS"
+      autocomplete="off" />
+  </section>
+
+  <section>
+    <h2>1. Foto referensi (5)</h2>
+    <input id="images" type="file" accept="image/*" multiple />
+    <div class="thumbs" id="thumbs"></div>
+  </section>
+
+  <section>
+    <h2>2. Tantangan liveness (opsional)</h2>
+    <div class="row">
+      <button id="getChallenge" class="secondary" type="button">Ambil tantangan</button>
+      <button id="clearChallenge" class="secondary" type="button" hidden>Lewati liveness</button>
+      <span id="challengeState"><small>belum ada tantangan</small></span>
+    </div>
+    <ol class="actions" id="actionList"></ol>
+  </section>
+
+  <section>
+    <h2>3. Rekam video</h2>
+    <video id="preview" autoplay muted playsinline></video>
+    <div class="cue" id="cue"></div>
+    <div class="row">
+      <button id="camera" class="secondary" type="button">Nyalakan kamera</button>
+      <button id="record" type="button" disabled>Rekam</button>
+      <span id="recState"><small>belum ada rekaman</small></span>
+    </div>
+    <div class="row">
+      <small>Atau unggah file video:</small>
+      <input id="videoFile" type="file" accept="video/*" />
+    </div>
+  </section>
+
+  <section>
+    <h2>4. Hasil</h2>
+    <div class="row">
+      <button id="submit" type="button">Bandingkan wajah</button>
+      <button id="submitLiveness" class="secondary" type="button" disabled>Cek liveness saja</button>
+    </div>
+    <div id="result" style="margin-top:14px"></div>
+    <pre id="raw" hidden></pre>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let stream = null, recorded = null, recordedType = 'video/webm', challenge = null;
+
+const secondsPerAction = 3;
+
+$('images').addEventListener('change', () => {
+  $('thumbs').innerHTML = '';
+  for (const file of $('images').files) {
+    const img = document.createElement('img');
+    img.src = URL.createObjectURL(file);
+    $('thumbs').append(img);
+  }
+});
+
+// --- challenge --------------------------------------------------------------
+
+function renderActions(activeIndex = -1) {
+  $('actionList').innerHTML = (challenge?.actions ?? [])
+    .map((item, index) => {
+      const state = index < activeIndex ? 'done' : index === activeIndex ? 'active' : '';
+      return `<li class="${state}"><span class="pill">${item.action}</span> ${item.instruction}</li>`;
+    })
+    .join('');
+}
+
+// The key lives in this browser and nowhere else. localStorage rather than a
+// cookie: nothing here should ever be sent automatically with a request that
+// did not mean to carry it.
+const API_KEY_STORAGE = 'fsa-demo-api-key';
+
+try {
+  $('apiKey').value = localStorage.getItem(API_KEY_STORAGE) ?? '';
+} catch {
+  // Private windows and blocked site data: the field simply starts empty.
+}
+
+$('apiKey').addEventListener('change', (event) => {
+  try {
+    localStorage.setItem(API_KEY_STORAGE, event.target.value.trim());
+  } catch {
+    // Not being able to remember it is not a reason to refuse to use it.
+  }
+});
+
+// One place, so no call site can forget the header.
+function apiHeaders(extra = {}) {
+  const key = $('apiKey').value.trim();
+  return key ? { ...extra, 'X-API-Key': key } : extra;
+}
+
+$('getChallenge').addEventListener('click', async () => {
+  const response = await fetch('/api/v1/liveness/challenge', {
+    method: 'POST',
+    headers: apiHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({}),
+  });
+  const payload = await response.json();
+
+  if (!response.ok) {
+    challenge = null;
+    return showError(payload);
+  }
+
+  challenge = payload;
+  $('challengeState').innerHTML =
+    `<small>tantangan aktif — berlaku ${challenge.ttl_seconds} detik</small>`;
+  $('clearChallenge').hidden = false;
+  $('submitLiveness').disabled = false;
+  renderActions();
+});
+
+$('clearChallenge').addEventListener('click', () => {
+  challenge = null;
+  $('actionList').innerHTML = '';
+  $('challengeState').innerHTML = '<small>belum ada tantangan</small>';
+  $('clearChallenge').hidden = true;
+  $('submitLiveness').disabled = true;
+});
+
+// --- recording --------------------------------------------------------------
+
+$('camera').addEventListener('click', async () => {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, facingMode: 'user' }, audio: false });
+    $('preview').srcObject = stream;
+    $('record').disabled = false;
+  } catch (err) {
+    alert('Tidak bisa mengakses kamera: ' + err.message);
+  }
+});
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+$('record').addEventListener('click', async () => {
+  if (!stream) return;
+  const mime = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4']
+    .find((m) => MediaRecorder.isTypeSupported(m)) || '';
+  const recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+  const chunks = [];
+  recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+
+  const finished = new Promise((resolve) => {
+    recorder.onstop = () => {
+      recordedType = (mime || 'video/webm').split(';')[0];
+      recorded = new Blob(chunks, { type: recordedType });
+      resolve();
+    };
+  });
+
+  $('record').disabled = true;
+  $('recState').innerHTML = '<small>merekam…</small>';
+  recorder.start();
+
+  const actions = challenge?.actions ?? [];
+  if (actions.length) {
+    $('cue').textContent = 'Bersiap…';
+    await sleep(1200);
+    for (let index = 0; index < actions.length; index++) {
+      renderActions(index);
+      for (let left = secondsPerAction; left > 0; left--) {
+        $('cue').textContent = `${actions[index].instruction} (${left})`;
+        await sleep(1000);
+      }
+    }
+    renderActions(actions.length);
+    $('cue').textContent = 'Selesai — kembali menghadap kamera.';
+    await sleep(1200);
+  } else {
+    $('cue').textContent = 'Menghadap kamera…';
+    await sleep(5000);
+  }
+
+  recorder.stop();
+  await finished;
+  $('cue').textContent = '';
+  $('recState').innerHTML = `<small>rekaman siap — ${(recorded.size / 1024 / 1024).toFixed(2)} MB</small>`;
+  $('record').disabled = false;
+});
+
+$('videoFile').addEventListener('change', () => {
+  const file = $('videoFile').files[0];
+  if (file) { recorded = file; recordedType = file.type; $('recState').innerHTML = `<small>pakai file: ${file.name}</small>`; }
+});
+
+// --- submit -----------------------------------------------------------------
+
+function videoName() {
+  return recorded.name || `recording.${recordedType.includes('mp4') ? 'mp4' : 'webm'}`;
+}
+
+function showError(data) {
+  $('result').innerHTML =
+    `<div class="verdict bad">${data.error?.code ?? 'error'}</div><small>${data.error?.message ?? ''}</small>`;
+}
+
+function livenessHtml(liveness) {
+  if (!liveness) return '';
+  const rows = liveness.actions
+    .map((item) => `<div><small class="${item.performed ? 'ok' : 'bad'}">${item.performed ? '✓' : '✗'} ${item.action}${item.reason ? ` (${item.reason})` : ''}</small></div>`)
+    .join('');
+  return `<div style="margin-top:10px"><span class="pill ${liveness.live ? 'ok' : 'bad'}">liveness: ${liveness.live ? 'LIVE' : 'GAGAL'}</span>${rows}</div>`;
+}
+
+$('submit').addEventListener('click', async () => {
+  const images = $('images').files;
+  if (!images.length) return alert('Pilih foto referensi dulu.');
+  if (!recorded) return alert('Rekam atau unggah video dulu.');
+
+  const body = new FormData();
+  for (const file of images) body.append('images', file, file.name);
+  body.append('video', recorded, videoName());
+  if (challenge) body.append('challenge_token', challenge.token);
+
+  $('result').innerHTML = '<small>memproses…</small>';
+  $('raw').hidden = true;
+
+  const response = await fetch('/api/v1/face/verify', { method: 'POST', headers: apiHeaders(), body });
+  const data = await response.json();
+
+  $('raw').hidden = false;
+  $('raw').textContent = JSON.stringify(data, null, 2);
+  if (!response.ok) return showError(data);
+
+  const tone = data.passed ? 'ok' : data.decision === 'no_match' ? 'bad' : 'warn';
+  $('result').innerHTML = `
+    <div class="verdict ${tone}">${data.passed ? 'LULUS' : 'TIDAK LULUS'} — ${data.decision.toUpperCase()} ${data.score_percent}%</div>
+    <div class="bar"><i style="width:${Math.min(100, data.score_percent)}%"></i></div>
+    <small>cosine ${data.score} (threshold ${data.thresholds.match_threshold}) ·
+      confidence ${(data.confidence * 100).toFixed(1)}% ·
+      frame cocok ${data.video.frames_matched}/${data.video.frames_with_face} ·
+      ${data.processing_ms} ms</small>
+    ${livenessHtml(data.liveness)}
+    ${data.warnings.map((w) => `<div><small class="warn">⚠ ${w}</small></div>`).join('')}`;
+});
+
+$('submitLiveness').addEventListener('click', async () => {
+  if (!challenge) return alert('Ambil tantangan dulu.');
+  if (!recorded) return alert('Rekam atau unggah video dulu.');
+
+  const body = new FormData();
+  body.append('token', challenge.token);
+  body.append('video', recorded, videoName());
+
+  $('result').innerHTML = '<small>memproses…</small>';
+  $('raw').hidden = true;
+
+  const response = await fetch('/api/v1/liveness/verify', { method: 'POST', headers: apiHeaders(), body });
+  const data = await response.json();
+
+  $('raw').hidden = false;
+  $('raw').textContent = JSON.stringify(data, null, 2);
+  if (!response.ok) return showError(data);
+
+  $('result').innerHTML = `
+    <div class="verdict ${data.live ? 'ok' : 'bad'}">${data.live ? 'LIVE' : 'TIDAK TERDETEKSI'}</div>
+    <small>frame berwajah ${data.frames_with_face}/${data.frames_sampled} ·
+      gerak ${data.movement_score} · ${data.processing_ms} ms</small>
+    ${livenessHtml(data)}
+    ${data.warnings.map((w) => `<div><small class="warn">⚠ ${w}</small></div>`).join('')}`;
+});
+</script>
+</body>
+</html>
