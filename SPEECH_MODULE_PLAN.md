@@ -96,19 +96,28 @@ Face harus berubah, **STOP dan laporkan**.
 
 ### R.5a Status langkah 13–18 (2026-09-30)
 
-Semua perangkat sudah ada dan terverifikasi di macOS; **belum ada satu pun angka Linux**,
-karena setiap job GitHub Actions ditolak: *"The job was not started because your account is
-locked due to a billing issue."* Yang siap dijalankan begitu Actions (atau host Linux) tersedia:
+Semua perangkat sudah ada dan terverifikasi di macOS; **belum ada satu pun angka Linux.**
+Repo ini tidak memakai GitHub Actions, jadi validasi Linux dijalankan dengan satu skrip di host
+Ubuntu 24.04 x86_64 — idealnya server Speech target atau mesin yang spesifikasinya setara:
+
+```bash
+scripts/linux_validation.sh matrix python3.10 python3.11 python3.12   # langkah 13
+scripts/linux_validation.sh benchmark python3.12                      # langkah 14
+sudo CONFIRM_THROWAWAY_HOST=yes BENCHMARK_JSON=validation-results/<ts>/benchmark/benchmark.json \
+    scripts/linux_validation.sh staging                               # langkah 17-18, VM buangan
+```
+
+Hasilnya ada di `validation-results/<timestamp>/` (diabaikan git) dan itulah yang dikirim balik.
 
 | Langkah | Perangkat | Status |
 |---|---|---|
-| 13 | `.github/workflows/speech-validation.yml` job `matrix` (py3.10/3.11/3.12, Ubuntu 24.04 x86_64): install penuh + bukti insightface dibuild dari sdist, perbandingan versi paket per paket dengan install Face-only `f1f002f`, `pip check`, import, ruff, test Speech/Face/penuh, smoke Face nyata base-vs-feature & dua urutan import, smoke Speech nyata offline | siap; diblokir billing |
-| 14 | job `benchmark`: korpus `scripts/build_stt_corpus.py` (FLEURS + LibriVox Indonesia, manusia nyata), `base`/`small` × 2/4 thread, 3 run warm | siap; diblokir billing |
+| 13 | `matrix`: per interpreter, install penuh + bukti insightface dibuild dari sdist, perbandingan versi paket per paket dengan install Face-only `f1f002f`, `pip check`, import, ruff, test Speech/Face/penuh, smoke Face nyata base-vs-feature & dua urutan import, smoke Speech nyata offline | siap; menunggu host Linux |
+| 14 | `benchmark`: korpus `scripts/build_stt_corpus.py` (FLEURS + LibriVox Indonesia, manusia nyata), `base`/`small` × 2 dan semua core, 3 run warm, plus memori Face | siap; menunggu host Linux |
 | 15C | provisioning: `scripts/provision_stt_model.py`; model hilang → 503 `model_not_provisioned` dalam ~30 ms; cek disk saat boot | ✅ (commit `eb2cd8d`) |
 | 17 | `deploy/systemd/`, `deploy/nginx/`, `deploy/env/speech.env.example` | ditulis; `MemoryMax` menunggu 14 |
-| 18 | `scripts/smoke_deploy.py` (25 cek HTTP + cek systemd/strace); job `staging` men-deploy ke VM Ubuntu 24.04 sesuai README lalu menjalankannya | 25/25 hijau secara lokal tanpa nginx/systemd; job diblokir billing |
+| 18 | `scripts/smoke_deploy.py` (25 cek HTTP + cek systemd/strace); `staging` men-deploy ke host sesuai README lalu menjalankannya | 25/25 hijau secara lokal tanpa nginx/systemd; menunggu VM Linux |
 
-**Aturan `MemoryMax` yang diusulkan** (dipakai job `staging`, angka produksi diputuskan saat
+**Aturan `MemoryMax` yang diusulkan** (dipakai mode `staging`, angka produksi diputuskan saat
 review): `MemoryMax = ceil(1,5 × puncak RSS proses terukur / 256 MiB) × 256 MiB` untuk model dan
 jumlah thread produksi. Puncak proses (`ru_maxrss`, termasuk saat load) — bukan RSS setelah
 load — karena itulah yang harus muat. Margin 1,5× menampung fragmentasi heap selama uptime,

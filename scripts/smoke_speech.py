@@ -53,6 +53,8 @@ def main() -> None:
 
     sys.addaudithook(audit)
 
+    # Always this checkout's code: this smoke has no base revision to compare.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     import av
     from fastapi.testclient import TestClient
 

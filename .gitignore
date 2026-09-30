@@ -9,3 +9,4 @@ models/
 *.egg-info/
 .DS_Store
 .corpus-cache/
+validation-results/
