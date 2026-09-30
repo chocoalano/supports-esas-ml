@@ -416,8 +416,14 @@ def test_a_missing_library_is_a_503_not_a_crash(monkeypatch, speech_settings):
 
     assert transcribed.status_code == 503
     assert transcribed.json()["error"]["code"] == "speech_engine_unavailable"
+    assert transcribed.json()["error"]["details"] == {"reason": "engine_not_installed"}
     assert synthesised.status_code == 503
     assert synthesised.json()["error"]["code"] == "speech_engine_unavailable"
+    assert synthesised.json()["error"]["details"] == {"reason": "engine_not_installed"}
+    # Which library is missing is the operator's business; it is in the log.
+    for response in (transcribed, synthesised):
+        assert "whisper" not in response.text.lower()
+        assert "edge" not in response.text.lower()
 
 
 def test_nothing_loads_the_model_but_a_transcription(monkeypatch, speech_settings):

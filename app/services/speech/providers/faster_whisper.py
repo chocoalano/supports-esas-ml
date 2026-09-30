@@ -46,9 +46,13 @@ class FasterWhisperEngine:
                 from faster_whisper import WhisperModel
                 from faster_whisper.utils import download_model
             except ImportError as exc:
+                logger.error(
+                    "faster-whisper is not installed (%s). Run `pip install -r requirements.txt`.",
+                    exc,
+                )
                 raise SpeechEngineUnavailableError(
-                    "faster-whisper is not installed. Run `pip install -r requirements.txt`.",
-                    details={"import_error": str(exc)},
+                    "The speech-to-text engine is not installed on this server.",
+                    details={"reason": "engine_not_installed"},
                 ) from exc
 
             settings = self._settings
@@ -89,10 +93,20 @@ class FasterWhisperEngine:
                     # FSA_STT_MAX_CONCURRENT x FSA_STT_CPU_THREADS.
                     num_workers=max(1, settings.stt_max_concurrent),
                 )
-            except Exception as exc:  # pragma: no cover - depends on local models
+            except Exception as exc:
+                # Device, compute type, a corrupt model: the operator's to fix,
+                # and the library's words are for the log, not the caller.
+                logger.error(
+                    "Speech-to-text engine failed to load model '%s' (device=%s, "
+                    "compute_type=%s): %r",
+                    settings.stt_model,
+                    settings.stt_device,
+                    settings.stt_compute_type,
+                    exc,
+                )
                 raise SpeechEngineUnavailableError(
-                    "Failed to initialise the speech-to-text engine.",
-                    details={"reason": str(exc)},
+                    "The speech-to-text engine could not be started.",
+                    details={"reason": "engine_failed_to_load"},
                 ) from exc
 
             self._model = model

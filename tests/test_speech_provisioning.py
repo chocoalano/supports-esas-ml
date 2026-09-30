@@ -146,7 +146,7 @@ def test_a_speech_runtime_says_at_boot_that_its_model_is_missing(monkeypatch, ca
     with caplog.at_level(logging.ERROR, logger="app.main"), speech_runtime(monkeypatch):
         pass
 
-    assert any("model cannot be loaded" in record.message for record in caplog.records)
+    assert any("cannot load as configured" in record.message for record in caplog.records)
     assert whisper.constructed == []
 
 

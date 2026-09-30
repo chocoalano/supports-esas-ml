@@ -19,6 +19,7 @@ runtime never loads it. It ships its own FFmpeg build, and so does OpenCV.
 
 from __future__ import annotations
 
+import logging
 import tempfile
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -35,6 +36,8 @@ from app.core.errors import (
     PayloadTooLargeError,
     SpeechEngineUnavailableError,
 )
+
+logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 1024 * 1024
 HEAD_BYTES = 64
@@ -284,9 +287,10 @@ def _import_av():  # noqa: ANN202 - the module itself
     try:
         import av
     except ImportError as exc:
+        logger.error("PyAV is not installed (%s). Run `pip install -r requirements.txt`.", exc)
         raise SpeechEngineUnavailableError(
-            "The audio decoder is not installed. Run `pip install -r requirements.txt`.",
-            details={"import_error": str(exc)},
+            "The audio decoder is not installed on this server.",
+            details={"reason": "decoder_not_installed"},
         ) from exc
 
     return av

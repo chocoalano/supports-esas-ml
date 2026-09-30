@@ -11,12 +11,15 @@ arrive here as integers and are formatted here.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import aclosing
 
 from app.core.config import Settings
 from app.core.errors import SpeechEngineUnavailableError
 from app.services.speech.tts import SynthesisRequest
+
+logger = logging.getLogger(__name__)
 
 
 class EdgeTtsEngine:
@@ -35,9 +38,12 @@ class EdgeTtsEngine:
         try:
             import edge_tts
         except ImportError as exc:
+            logger.error(
+                "edge-tts is not installed (%s). Run `pip install -r requirements.txt`.", exc
+            )
             raise SpeechEngineUnavailableError(
-                "edge-tts is not installed. Run `pip install -r requirements.txt`.",
-                details={"import_error": str(exc)},
+                "The text-to-speech engine is not installed on this server.",
+                details={"reason": "engine_not_installed"},
             ) from exc
 
         communicate = edge_tts.Communicate(

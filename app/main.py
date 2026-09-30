@@ -127,8 +127,8 @@ def _start_speech(settings: Settings) -> None:
         # same runtime does not need the model, and every transcription will
         # say what is missing with a fast 503 rather than a download.
         logger.error(
-            "Speech-to-text is enabled but its model cannot be loaded: %s. Transcriptions "
-            "will be refused with 503 until it is provisioned (scripts/provision_stt_model.py).",
+            "Speech-to-text is enabled but cannot load as configured: %s. Transcriptions "
+            "will be refused with 503 until this is fixed.",
             problem,
         )
 
