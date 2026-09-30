@@ -30,3 +30,13 @@ def build_tts_engine(settings: Settings) -> TextToSpeechEngine:
         return EdgeTtsEngine(settings)
 
     raise SpeechEngineUnavailableError(f"Unknown TTS provider '{settings.tts_provider}'.")
+
+
+def stt_provisioning_problem(settings: Settings) -> str | None:
+    """Why the configured STT model is not ready to load, checked on disk only."""
+    if settings.stt_provider == "faster_whisper":
+        from app.services.speech.providers.faster_whisper import provisioning_problem
+
+        return provisioning_problem(settings)
+
+    return None

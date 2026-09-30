@@ -285,7 +285,10 @@ def test_a_speech_runtime_serving_audio_never_imports_opencv(tmp_path):
                 return iter([types.SimpleNamespace(start=0, end=1, text="halo")]), \\
                     types.SimpleNamespace(language="id", language_probability=0.9)
         stub.WhisperModel = WhisperModel
+        stub.utils = types.ModuleType("faster_whisper.utils")
+        stub.utils.download_model = lambda name, **kwargs: "/nonexistent/model"
         sys.modules["faster_whisper"] = stub
+        sys.modules["faster_whisper.utils"] = stub.utils
 
         from fastapi.testclient import TestClient
         from app.main import app
@@ -523,14 +526,11 @@ def test_faster_whisper_is_configured_from_settings(monkeypatch, settings, tmp_p
 
     transcript = FasterWhisperEngine(configured).transcribe(clip, TranscribeOptions(language=None))
 
+    # Resolved by name into the model root, then loaded from the resolved path.
+    assert whisper.resolved == [("base", False, str(tmp_path))]
     ((model, kwargs),) = whisper.constructed
-    assert model == "base"
-    assert kwargs == {
-        "device": "cpu",
-        "compute_type": "int8",
-        "cpu_threads": 2,
-        "download_root": str(tmp_path),
-    }
+    assert model == whisper.model_dir
+    assert kwargs == {"device": "cpu", "compute_type": "int8", "cpu_threads": 2}
     assert whisper.transcribed[0]["beam_size"] == 1
     assert whisper.transcribed[0]["vad_filter"] is True
     assert transcript.text == "halo dunia"

@@ -8,10 +8,12 @@ connection to Microsoft. Each records what was asked of it.
 from __future__ import annotations
 
 import sys
+import tempfile
 import threading
 import time
 import types
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pytest
 
@@ -20,13 +22,33 @@ import pytest
 class WhisperRecord:
     constructed: list[tuple[str, dict]] = field(default_factory=list)
     transcribed: list[dict] = field(default_factory=list)
+    #: (name, local_files_only, cache_dir) for every model lookup.
+    resolved: list[tuple[str, bool, str | None]] = field(default_factory=list)
+    #: Where the stand-in "downloads" models to: one directory holding a model.bin.
+    model_dir: str = ""
+
+
+class LocalEntryNotFoundError(Exception):
+    """What huggingface_hub raises when a model is not cached and it may not download."""
 
 
 def install_faster_whisper(
-    monkeypatch: pytest.MonkeyPatch, *, load_seconds: float = 0.0, text: str = " halo dunia "
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    load_seconds: float = 0.0,
+    text: str = " halo dunia ",
+    missing: bool = False,
 ) -> WhisperRecord:
-    record = WhisperRecord()
+    """`missing=True`: the model is not provisioned and may not be downloaded."""
+    record = WhisperRecord(model_dir=tempfile.mkdtemp(prefix="fsa-stub-model-"))
+    (Path(record.model_dir) / "model.bin").write_bytes(b"weights")
     lock = threading.Lock()
+
+    def download_model(name: str, *, local_files_only: bool = False, cache_dir=None, **_):
+        record.resolved.append((name, local_files_only, cache_dir))
+        if missing:
+            raise LocalEntryNotFoundError("outgoing traffic has been disabled")
+        return record.model_dir
 
     class WhisperModel:
         supported_languages = ["en", "id", "ms"]
@@ -47,7 +69,11 @@ def install_faster_whisper(
 
     module = types.ModuleType("faster_whisper")
     module.WhisperModel = WhisperModel
+    utils = types.ModuleType("faster_whisper.utils")
+    utils.download_model = download_model
+    module.utils = utils
     monkeypatch.setitem(sys.modules, "faster_whisper", module)
+    monkeypatch.setitem(sys.modules, "faster_whisper.utils", utils)
 
     return record
 

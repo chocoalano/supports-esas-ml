@@ -16,6 +16,7 @@ from app.api.routes import health, liveness, speech, verify
 from app.core.config import RuntimeRole, Settings, get_settings
 from app.core.errors import register_exception_handlers
 from app.core.logging import configure_logging
+from app.services.speech.providers import stt_provisioning_problem
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +122,15 @@ def _start_speech(settings: Settings) -> None:
             get_stt_engine().load()
         except Exception:  # pragma: no cover - startup must not hard-fail
             logger.exception("Speech-to-text warm-up failed; it will retry on first request.")
+    elif settings.stt_enabled and (problem := stt_provisioning_problem(settings)):
+        # A disk lookup, not a model load. Logged rather than fatal: TTS in the
+        # same runtime does not need the model, and every transcription will
+        # say what is missing with a fast 503 rather than a download.
+        logger.error(
+            "Speech-to-text is enabled but its model cannot be loaded: %s. Transcriptions "
+            "will be refused with 503 until it is provisioned (scripts/provision_stt_model.py).",
+            problem,
+        )
 
 
 def create_app() -> FastAPI:

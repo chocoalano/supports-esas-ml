@@ -44,6 +44,7 @@ class FasterWhisperEngine:
                 return
             try:
                 from faster_whisper import WhisperModel
+                from faster_whisper.utils import download_model
             except ImportError as exc:
                 raise SpeechEngineUnavailableError(
                     "faster-whisper is not installed. Run `pip install -r requirements.txt`.",
@@ -51,6 +52,24 @@ class FasterWhisperEngine:
                 ) from exc
 
             settings = self._settings
+            try:
+                model_path = _model_path(settings, download_model, local_files_only=False)
+            except Exception as exc:
+                # With HF_HUB_OFFLINE=1 - as production runs - this is a
+                # filesystem lookup that fails in milliseconds, not a network
+                # timeout. The operator needs the detail; the caller does not.
+                logger.error(
+                    "Speech-to-text model '%s' is not available in %s: %r. Provision it "
+                    "with scripts/provision_stt_model.py before starting the Speech runtime.",
+                    settings.stt_model,
+                    settings.stt_model_root or "the HuggingFace cache",
+                    exc,
+                )
+                raise SpeechEngineUnavailableError(
+                    "The speech-to-text model is not provisioned on this server.",
+                    details={"reason": "model_not_provisioned"},
+                ) from exc
+
             logger.info(
                 "Loading faster-whisper model '%s' (device=%s, compute_type=%s)...",
                 settings.stt_model,
@@ -59,11 +78,10 @@ class FasterWhisperEngine:
             )
             try:
                 model = WhisperModel(
-                    settings.stt_model,
+                    model_path,
                     device=settings.stt_device,
                     compute_type=settings.stt_compute_type,
                     cpu_threads=settings.stt_cpu_threads,
-                    download_root=settings.stt_model_root,
                 )
             except Exception as exc:  # pragma: no cover - depends on local models
                 raise SpeechEngineUnavailableError(
@@ -119,3 +137,50 @@ class FasterWhisperEngine:
             ),
             segments=tuple(collected),
         )
+
+
+def _model_path(settings: Settings, download_model, *, local_files_only: bool) -> str:  # noqa: ANN001
+    """The directory holding the model's files, found - or fetched - by name.
+
+    Resolved here rather than handed to `WhisperModel` as a name, because
+    `WhisperModel` first tries the name as a path relative to the working
+    directory: `FSA_STT_MODEL=small` with a directory called `small` wherever
+    the service was started loads that directory instead. Only an absolute
+    path is taken as a local model; anything else is a model name.
+
+    Honours HF_HUB_OFFLINE: offline, a model that is not already cached raises
+    at once instead of reaching for the network.
+    """
+    if Path(settings.stt_model).is_absolute():
+        return settings.stt_model
+
+    return download_model(
+        settings.stt_model,
+        local_files_only=local_files_only,
+        cache_dir=settings.stt_model_root,
+    )
+
+
+def provisioning_problem(settings: Settings) -> str | None:
+    """Why the configured model could not be loaded right now, or None.
+
+    For boot: a lookup on disk, never a download and never a model load - it
+    costs milliseconds and no memory beyond importing the library.
+    """
+    try:
+        from faster_whisper.utils import download_model
+    except ImportError as exc:
+        return f"faster-whisper is not installed ({exc})"
+
+    try:
+        path = _model_path(settings, download_model, local_files_only=True)
+    except Exception as exc:
+        return (
+            f"model '{settings.stt_model}' is not in "
+            f"{settings.stt_model_root or 'the HuggingFace cache'} ({type(exc).__name__})"
+        )
+
+    if not (Path(path) / "model.bin").is_file():
+        return f"model directory {path} has no model.bin"
+
+    return None
