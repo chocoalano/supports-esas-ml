@@ -11,3 +11,9 @@ opencv-python-headless>=4.10,<6.0
 pytest>=8.3
 httpx>=0.27
 ruff>=0.6
+
+# The audio validator is our code and decodes with PyAV, so the decoder is real
+# in the suite - as opencv-python-headless is for the frame sampler. The speech
+# *engines* (faster-whisper, edge-tts) are not installed here: the suite fakes
+# them, and proves the app imports without them.
+av>=17.1,<18

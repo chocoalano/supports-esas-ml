@@ -9,3 +9,14 @@ numpy>=1.26,<2.3
 opencv-python-headless>=4.10,<5.0
 onnxruntime>=1.19,<2.0
 insightface==0.7.3
+
+# --- Speech (hanya dipakai FSA_RUNTIME_ROLE=speech/all; di-import lazy) ---------
+# Sempit dengan sengaja: hanya patch release yang boleh masuk otomatis. Minor
+# release baru = upgrade yang disengaja dan dites ulang, bukan efek samping redeploy.
+faster-whisper~=1.2.1
+edge-tts~=7.2.8
+# Dipin sendiri, bukan diserahkan ke faster-whisper (yang hanya menuntut av>=11):
+# tanpa pin, resolver memilih av 17.1 / 18.1 / 19.0 di py3.10 / 3.11 / 3.12 -
+# tiga build FFmpeg berbeda untuk satu codebase. 17.x adalah yang tertinggi yang
+# tersedia di ketiganya.
+av>=17.1,<18

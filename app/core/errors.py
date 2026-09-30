@@ -67,6 +67,90 @@ class EngineUnavailableError(AppError):
     status_code = 503
 
 
+# --- Speech ------------------------------------------------------------------
+#
+# Every one of these is its own code on purpose. A caller that falls back from
+# one feature to another has to know *which* engine is down, and "your audio is
+# not audio" has to be distinguishable from "your audio is too long" without
+# parsing an English sentence.
+
+
+class SttDisabledError(AppError):
+    code = "stt_disabled"
+    status_code = 503
+
+
+class TtsDisabledError(AppError):
+    code = "tts_disabled"
+    status_code = 503
+
+
+class AudioDecodeError(AppError):
+    code = "audio_decode_failed"
+    status_code = 422
+
+
+class NoAudioStreamError(AppError):
+    """The container opened, but holds nothing to listen to.
+
+    Separate from `audio_decode_failed` because "open" is not "audio": FFmpeg
+    has demuxers for images and video too, and a video-only MP4 is a perfectly
+    valid container.
+    """
+
+    code = "no_audio_stream"
+    status_code = 422
+
+
+class AudioTooLongError(AppError):
+    code = "audio_too_long"
+    status_code = 422
+
+
+class LanguageNotSupportedError(AppError):
+    code = "language_not_supported"
+    status_code = 422
+
+
+class SpeechEngineUnavailableError(AppError):
+    """Not `engine_unavailable`: a caller has to know it is speech that is down, not face."""
+
+    code = "speech_engine_unavailable"
+    status_code = 503
+
+
+class VoiceNotAvailableError(AppError):
+    code = "voice_not_available"
+    status_code = 422
+
+
+class InvalidSpeechRequestError(AppError):
+    code = "invalid_request"
+    status_code = 422
+
+
+class SpeechProviderError(AppError):
+    """A remote provider failed. 502, not 503: it is somebody else's outage.
+
+    The caller retries these differently from a local engine that is not
+    loaded, which is why they do not share a status.
+    """
+
+    code = "speech_provider_failed"
+    status_code = 502
+
+
+class TtsOutputTooLargeError(SpeechProviderError):
+    """The provider kept sending past the configured ceiling; nothing was returned."""
+
+    code = "tts_output_too_large"
+
+
+class SpeechProviderTimeoutError(AppError):
+    code = "speech_provider_timeout"
+    status_code = 504
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def _handle_app_error(_: Request, exc: AppError) -> JSONResponse:

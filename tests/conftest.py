@@ -19,18 +19,30 @@ read by the fake sampler.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from pathlib import Path
 
+import anyio
 import cv2
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.deps import get_challenge_service, get_face_engine, get_frame_sampler
-from app.core.config import Settings, get_settings
+from app.api.deps import (
+    get_challenge_service,
+    get_face_engine,
+    get_frame_sampler,
+    get_stt_engine,
+    get_stt_limiter,
+    get_tts_engine,
+    get_tts_limiter,
+)
+from app.core.config import RuntimeRole, Settings, get_settings
 from app.main import create_app
 from app.services.challenge import ChallengeService
 from app.services.face_engine import DetectedFace, normalise
+from app.services.speech.stt import TranscribeOptions, Transcript, TranscriptSegment
+from app.services.speech.tts import SynthesisRequest
 from app.services.video import SampledFrame, SampledVideo, evenly_spaced
 
 EMBEDDING_DIM = 128
@@ -239,15 +251,31 @@ def video_payload(
     return spec.encode()
 
 
+#: Process-wide singletons the speech tests create. Cleared around every test so
+#: none inherits another's engine, or a semaphore sized by another's settings.
+SPEECH_SINGLETONS = (get_stt_engine, get_tts_engine, get_stt_limiter, get_tts_limiter)
+
+
 @pytest.fixture(autouse=True)
 def _isolated_env(monkeypatch: pytest.MonkeyPatch):
-    """Keep a developer's local .env out of the suite and skip model warm-up."""
+    """Keep a developer's local .env out of the suite and skip model warm-up.
+
+    The runtime role is pinned too: it decides which routers exist, so a local
+    `.env` saying `speech` would otherwise turn every Face test into a 404.
+    `all` is the development/test role; tests about the other two set their own.
+    """
     monkeypatch.setenv("FSA_WARM_UP_ON_STARTUP", "false")
+    monkeypatch.setenv("FSA_STT_WARM_UP_ON_STARTUP", "false")
+    monkeypatch.setenv("FSA_RUNTIME_ROLE", RuntimeRole.ALL.value)
     get_settings.cache_clear()
     get_challenge_service.cache_clear()
+    for singleton in SPEECH_SINGLETONS:
+        singleton.cache_clear()
     yield
     get_settings.cache_clear()
     get_challenge_service.cache_clear()
+    for singleton in SPEECH_SINGLETONS:
+        singleton.cache_clear()
 
 
 @pytest.fixture
@@ -378,3 +406,130 @@ def clip_states(*actions: str, padding: int = 3) -> list[str]:
     for action in actions:
         states += [action, action] + ["neutral"] * padding
     return states
+
+
+# --- Speech ------------------------------------------------------------------
+#
+# The real providers are never imported by the suite: faster-whisper would need
+# ~500 MB of weights and edge-tts a network. The fakes stand in behind the same
+# Protocols. PyAV is real, because the audio validator is code of ours under test.
+
+#: One MPEG-1 Layer III frame header (128 kbps, 44.1 kHz) padded to frame size.
+#: Enough for the service's "is this MP3" check, which is all the fake needs.
+MP3_FRAME = bytes([0xFF, 0xFB, 0x90, 0x64]) + bytes(413)
+
+
+class FakeSttEngine:
+    name = "fake-stt"
+
+    def __init__(self, transcript: Transcript | None = None) -> None:
+        self.transcript = transcript or Transcript(
+            text="halo dunia",
+            language="id",
+            language_probability=0.97,
+            segments=(
+                TranscriptSegment(start=0.0, end=1.2, text="halo"),
+                TranscriptSegment(start=1.2, end=2.0, text="dunia"),
+            ),
+        )
+        self.error: Exception | None = None
+        #: Times the "model" was actually loaded - not times `load()` was called.
+        self.loads = 0
+        self.calls: list[TranscribeOptions] = []
+        #: Whether the upload was still on disk while the engine held it.
+        self.path_existed: list[bool] = []
+
+    def is_loaded(self) -> bool:
+        return self.loads > 0
+
+    def load(self) -> None:
+        if not self.loads:
+            self.loads += 1
+
+    def transcribe(self, path: Path, options: TranscribeOptions) -> Transcript:
+        self.load()
+        self.calls.append(options)
+        self.path_existed.append(path.exists())
+        if self.error is not None:
+            raise self.error
+        return self.transcript
+
+
+class FakeTtsEngine:
+    """Yields `chunks`; can fail before chunk `fail_at`, or dawdle for `delay` seconds."""
+
+    name = "fake-tts"
+
+    def __init__(
+        self,
+        chunks: list[bytes] | None = None,
+        *,
+        error: Exception | None = None,
+        fail_at: int = 0,
+        delay: float = 0.0,
+    ) -> None:
+        self.chunks = chunks if chunks is not None else [MP3_FRAME, MP3_FRAME]
+        self.error = error
+        self.fail_at = fail_at
+        self.delay = delay
+        self.requests: list[SynthesisRequest] = []
+        self.active = 0
+        self.peak = 0
+        #: Streams that ran their cleanup - i.e. were closed, not abandoned.
+        self.closed = 0
+
+    async def stream(self, request: SynthesisRequest) -> AsyncIterator[bytes]:
+        self.requests.append(request)
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        try:
+            for index, chunk in enumerate(self.chunks):
+                if self.error is not None and index == self.fail_at:
+                    raise self.error
+                if self.delay:
+                    await anyio.sleep(self.delay)
+                yield chunk
+            if self.error is not None and self.fail_at >= len(self.chunks):
+                raise self.error
+        finally:
+            self.active -= 1
+            self.closed += 1
+
+
+@pytest.fixture
+def speech_settings(settings: Settings) -> Settings:
+    return settings.model_copy(
+        update={"runtime_role": RuntimeRole.ALL, "stt_enabled": True, "tts_enabled": True}
+    )
+
+
+@pytest.fixture
+def stt_engine() -> FakeSttEngine:
+    return FakeSttEngine()
+
+
+@pytest.fixture
+def tts_engine() -> FakeTtsEngine:
+    return FakeTtsEngine()
+
+
+def make_speech_client(
+    settings: Settings,
+    stt: FakeSttEngine,
+    tts: FakeTtsEngine,
+    *,
+    api_key: str | None = API_KEY,
+) -> TestClient:
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_stt_engine] = lambda: stt
+    app.dependency_overrides[get_tts_engine] = lambda: tts
+    return TestClient(app, headers={"X-API-Key": api_key} if api_key else {})
+
+
+@pytest.fixture
+def speech_client(
+    speech_settings: Settings, stt_engine: FakeSttEngine, tts_engine: FakeTtsEngine
+):
+    with make_speech_client(speech_settings, stt_engine, tts_engine) as test_client:
+        yield test_client

@@ -16,9 +16,13 @@ from fastapi import Depends, Header
 from app.api.security import require_api_key
 from app.api.throttle import FixedWindowLimiter
 from app.core.config import Settings, get_settings
+from app.core.errors import SttDisabledError, TtsDisabledError
 from app.services.challenge import ChallengeService
 from app.services.face_engine import FaceEngine, InsightFaceEngine
 from app.services.liveness import LivenessService
+from app.services.speech.providers import build_stt_engine, build_tts_engine
+from app.services.speech.stt import SpeechToTextEngine, SpeechToTextService
+from app.services.speech.tts import TextToSpeechEngine, TextToSpeechService
 from app.services.verification import VerificationService
 from app.services.video import FrameSampler, OpenCVFrameSampler
 
@@ -140,3 +144,66 @@ def get_liveness_service(
 
 ChallengeServiceDep = Annotated[ChallengeService, Depends(get_challenge_service)]
 LivenessServiceDep = Annotated[LivenessService, Depends(get_liveness_service)]
+
+
+# --- Speech ------------------------------------------------------------------
+#
+# Speech shares nothing with Face below this line: its own engines, its own
+# semaphores. `get_inference_limiter()` stays Face's alone, and so does the
+# meaning of FSA_MAX_CONCURRENT_INFERENCES.
+
+
+@lru_cache
+def get_stt_engine() -> SpeechToTextEngine:
+    return build_stt_engine(get_settings())
+
+
+@lru_cache
+def get_tts_engine() -> TextToSpeechEngine:
+    return build_tts_engine(get_settings())
+
+
+@lru_cache
+def get_stt_limiter() -> Semaphore:
+    return Semaphore(max(1, get_settings().stt_max_concurrent))
+
+
+@lru_cache
+def get_tts_limiter() -> Semaphore:
+    return Semaphore(max(1, get_settings().tts_max_concurrent))
+
+
+def require_stt(settings: SettingsDep) -> None:
+    if not settings.stt_enabled:
+        raise SttDisabledError("Speech-to-text is disabled on this service.")
+
+
+def require_tts(settings: SettingsDep) -> None:
+    if not settings.tts_enabled:
+        raise TtsDisabledError("Text-to-speech is disabled on this service.")
+
+
+# The feature gate is declared before the engine, and FastAPI resolves a
+# dependency's parameters in order: a disabled feature refuses the request
+# without its engine ever being constructed.
+
+
+def get_stt_service(
+    settings: SettingsDep,
+    _enabled: Annotated[None, Depends(require_stt)],
+    engine: Annotated[SpeechToTextEngine, Depends(get_stt_engine)],
+) -> SpeechToTextService:
+    return SpeechToTextService(engine=engine, settings=settings, limiter=get_stt_limiter())
+
+
+def get_tts_service(
+    settings: SettingsDep,
+    _enabled: Annotated[None, Depends(require_tts)],
+    engine: Annotated[TextToSpeechEngine, Depends(get_tts_engine)],
+) -> TextToSpeechService:
+    return TextToSpeechService(engine=engine, settings=settings, limiter=get_tts_limiter())
+
+
+TtsEnabledDep = Annotated[None, Depends(require_tts)]
+SttServiceDep = Annotated[SpeechToTextService, Depends(get_stt_service)]
+TtsServiceDep = Annotated[TextToSpeechService, Depends(get_tts_service)]
