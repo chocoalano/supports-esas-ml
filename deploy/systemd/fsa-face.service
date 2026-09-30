@@ -1,0 +1,34 @@
+# Face runtime: /face/* and /liveness/*. Identical to the face-api.service the
+# README has always documented, with the runtime role made explicit.
+#
+#   /etc/systemd/system/fsa-face.service
+[Unit]
+Description=Face Similarity API - Face runtime (Face + Liveness)
+After=network.target
+
+[Service]
+Type=exec
+User=faceapi
+Group=faceapi
+WorkingDirectory=/opt/face-api/app
+EnvironmentFile=/opt/face-api/app/.env
+# Set here, after the env file, so no value in it can change what this unit is.
+Environment=FSA_RUNTIME_ROLE=face
+Environment=FSA_STT_ENABLED=false
+Environment=FSA_TTS_ENABLED=false
+ExecStart=/opt/face-api/venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 --port 8001 --workers 2 --timeout-keep-alive 65
+Restart=always
+RestartSec=5
+# Model butuh waktu dimuat saat start.
+TimeoutStartSec=120
+
+# Pengetatan dasar
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/face-api/models
+
+[Install]
+WantedBy=multi-user.target

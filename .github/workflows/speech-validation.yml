@@ -216,9 +216,136 @@ jobs:
           path: out/
           if-no-files-found: warn
 
+  staging:
+    # A throwaway Ubuntu 24.04 VM deployed exactly as the README documents -
+    # systemd units, nginx, provisioned model - then smoke-tested. Not a server
+    # of ours: nothing outlives the job.
+    name: Staging deploy (systemd + nginx) and smoke
+    needs: [benchmark]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      OUT: ${{ github.workspace }}/out/staging
+      KEY: staging-shared-key-${{ github.run_id }}
+      # MemoryMax for the model staged here. The production value is decided
+      # from the benchmark in review; staging proves the mechanism with the same rule.
+      STAGED_MODEL: small
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: benchmark
+          path: bench
+
+      - name: Server packages (README step 1)
+        run: |
+          mkdir -p "$OUT"
+          sudo apt-get update -q
+          sudo apt-get install -y -q python3.12 python3.12-venv python3.12-dev \
+            build-essential libglib2.0-0 libgomp1 nginx strace
+
+      - name: Code, venv, requirements (README step 2) - runtime only
+        run: |
+          sudo useradd -r -m -d /opt/face-api -s /usr/sbin/nologin faceapi
+          sudo mkdir -p /opt/face-api/app /opt/face-api/speech /opt/face-api/models/stt
+          sudo rsync -a --exclude .git ./ /opt/face-api/app/
+          sudo chown -R faceapi:faceapi /opt/face-api
+          sudo -u faceapi python3.12 -m venv /opt/face-api/venv
+          sudo -u faceapi /opt/face-api/venv/bin/pip install -q --upgrade pip "cython<3.1" "numpy<2.3"
+          sudo -u faceapi /opt/face-api/venv/bin/pip install -q -r /opt/face-api/app/requirements.txt
+          # The deploy smoke's HTTP client; not a runtime dependency.
+          sudo -u faceapi /opt/face-api/venv/bin/pip install -q httpx
+
+      - name: Configuration (README step 3), both runtimes, one shared key
+        run: |
+          cd /opt/face-api/app
+          sudo -u faceapi cp .env.example .env
+          sudo -u faceapi sed -i \
+            -e "s|^FSA_API_KEYS=.*|FSA_API_KEYS=laravel:$KEY|" \
+            -e "s|^FSA_CHALLENGE_SECRET=.*|FSA_CHALLENGE_SECRET=staging-secret|" .env
+          echo "FSA_MODEL_ROOT=/opt/face-api/models" | sudo -u faceapi tee -a .env > /dev/null
+          # Same key on both runtimes on purpose: then only the separate nginx
+          # zones can keep Speech from spending Face's budget.
+          sed -e "s|^FSA_API_KEYS=.*|FSA_API_KEYS=laravel:$KEY|" \
+              -e "s|^FSA_STT_MODEL=.*|FSA_STT_MODEL=$STAGED_MODEL|" \
+            deploy/env/speech.env.example | sudo -u faceapi tee /opt/face-api/speech.env > /dev/null
+          sudo chmod 600 .env /opt/face-api/speech.env
+
+      - name: Provision models - Face (README) and Speech (provision_stt_model.py)
+        run: |
+          sudo -u faceapi /opt/face-api/venv/bin/python -c \
+            "from insightface.app import FaceAnalysis; FaceAnalysis(name='buffalo_l', root='/opt/face-api/models', allowed_modules=['detection','recognition','landmark_3d_68']).prepare(ctx_id=-1)"
+          cd /opt/face-api/app
+          sudo -u faceapi /opt/face-api/venv/bin/python scripts/provision_stt_model.py \
+            --env-file /opt/face-api/speech.env | tee "$OUT/provision.json"
+
+      - name: systemd units, MemoryMax from the measured peak
+        run: |
+          python3 - <<'EOF' | sudo tee "$OUT/memory.conf"
+          import json, math, os
+          reports = json.load(open("bench/benchmark/benchmark.json"))["reports"]
+          peak = max(r["rss_process_peak_mb"] for r in reports if r["model"] == os.environ["STAGED_MODEL"])
+          limit = math.ceil(peak * 1.5 / 256) * 256
+          print("[Service]")
+          print(f"# 1.5 x measured process peak {peak:.0f} MB, rounded up to 256 MiB")
+          print(f"MemoryMax={limit}M")
+          EOF
+          sudo cp deploy/systemd/fsa-face.service deploy/systemd/fsa-speech.service /etc/systemd/system/
+          sudo mkdir -p /etc/systemd/system/fsa-speech.service.d
+          sudo cp "$OUT/memory.conf" /etc/systemd/system/fsa-speech.service.d/memory.conf
+          sudo systemd-analyze verify /etc/systemd/system/fsa-face.service /etc/systemd/system/fsa-speech.service
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now fsa-face fsa-speech
+          for port in 8001 8002; do
+            for i in $(seq 1 120); do curl -sf "http://127.0.0.1:$port/api/v1/health" && break; sleep 1; done
+            echo
+          done
+
+      - name: nginx (README step 5) with a self-signed certificate
+        run: |
+          sudo mkdir -p /etc/letsencrypt/live/face-api.example.com
+          sudo openssl req -x509 -nodes -newkey rsa:2048 -days 1 -subj "/CN=face-api.example.com" \
+            -keyout /etc/letsencrypt/live/face-api.example.com/privkey.pem \
+            -out /etc/letsencrypt/live/face-api.example.com/fullchain.pem
+          sudo cp deploy/nginx/fsa-zones.conf /etc/nginx/conf.d/
+          sudo cp deploy/nginx/fsa.conf /etc/nginx/sites-available/fsa.conf
+          sudo rm -f /etc/nginx/sites-enabled/default
+          sudo ln -sf /etc/nginx/sites-available/fsa.conf /etc/nginx/sites-enabled/fsa.conf
+          sudo nginx -t
+          sudo systemctl reload nginx
+
+      - name: Smoke test (step 18)
+        run: |
+          cd /opt/face-api/app
+          sudo -u faceapi mkdir -p /opt/face-api/smoke
+          sudo /opt/face-api/venv/bin/python scripts/build_stt_corpus.py /tmp/corpus --cache /tmp/corpus-cache > /dev/null
+          sudo /opt/face-api/venv/bin/python scripts/smoke_deploy.py \
+            --url https://127.0.0.1 --insecure --face-key "$KEY" --speech-key "$KEY" \
+            --audio /tmp/corpus/pendek_pria/02.wav --systemd --output "$OUT/smoke.json"
+
+      - if: always()
+        name: Collect unit state and logs
+        run: |
+          mkdir -p "$OUT"
+          for unit in fsa-face fsa-speech; do
+            systemctl show "$unit" -p ActiveState -p MemoryMax -p MemoryPeak -p MemoryCurrent \
+              -p CPUWeight -p NRestarts -p Environment > "$OUT/$unit.show" || true
+            sudo journalctl -u "$unit" --no-pager > "$OUT/$unit.journal" || true
+          done
+          sudo cp /var/log/nginx/error.log "$OUT/nginx-error.log" || true
+          sudo chown -R "$(id -u)" "$OUT"
+
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: staging
+          path: out/
+          if-no-files-found: warn
+
   publish:
     name: Commit the measurements to ci/speech-validation-results
-    needs: [matrix, benchmark]
+    needs: [matrix, benchmark, staging]
     if: always()
     runs-on: ubuntu-24.04
     permissions:
@@ -233,7 +360,7 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN: ${{ github.run_id }}-${{ github.run_attempt }}
           SHA: ${{ github.sha }}
-          RESULTS: matrix=${{ needs.matrix.result }} benchmark=${{ needs.benchmark.result }}
+          RESULTS: matrix=${{ needs.matrix.result }} benchmark=${{ needs.benchmark.result }} staging=${{ needs.staging.result }}
         run: |
           git init -q results && cd results
           git remote add origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"

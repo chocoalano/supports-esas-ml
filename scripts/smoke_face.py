@@ -56,6 +56,75 @@ class PeakRss:
         self.peak = max(self.peak, rss_mb())
 
 
+# -- the photographs: lazy imports, so --preimport decides what loads first ----------
+
+
+def png(image) -> bytes:  # noqa: ANN001 - np.ndarray, imported lazily
+    import cv2
+
+    ok, buffer = cv2.imencode(".png", image)
+    assert ok
+    return buffer.tobytes()
+
+
+def portrait(image, size: int = 320):  # noqa: ANN001, ANN201
+    """A tight aligned crop, given the margin a detector expects."""
+    import cv2
+
+    padded = cv2.copyMakeBorder(image, 40, 40, 40, 40, cv2.BORDER_REPLICATE)
+    return cv2.resize(padded, (size, size), interpolation=cv2.INTER_CUBIC)
+
+
+def variant(image, *, angle=0.0, brightness=0, flip=False, zoom=1.0):  # noqa: ANN001, ANN201
+    import cv2
+
+    height, width = image.shape[:2]
+    matrix = cv2.getRotationMatrix2D((width / 2, height / 2), angle, zoom)
+    out = cv2.warpAffine(image, matrix, (width, height), borderMode=cv2.BORDER_REPLICATE)
+    out = cv2.convertScaleAbs(out, alpha=1.0, beta=brightness)
+    return cv2.flip(out, 1) if flip else out
+
+
+def clip(image, frames: int = 40) -> bytes:  # noqa: ANN001
+    import cv2
+    import numpy as np
+
+    path = Path(tempfile.mkdtemp()) / "clip.mp4"
+    height, width = image.shape[:2]
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 10, (width, height))
+    for index in range(frames):
+        shift = np.float32([[1, 0, 3 * np.sin(index / 4)], [0, 1, 2 * np.cos(index / 5)]])
+        frame = cv2.warpAffine(image, shift, (width, height), borderMode=cv2.BORDER_REPLICATE)
+        writer.write(frame)
+    writer.release()
+    return path.read_bytes()
+
+
+def enrolled_person():  # noqa: ANN201
+    """(portrait, five enrolment shots, one capture) of the person in the sample photo."""
+    from insightface.data import get_image
+
+    person = portrait(get_image("Tom_Hanks_54745"))
+    enrolment = [
+        variant(person),
+        variant(person, flip=True),
+        variant(person, brightness=25),
+        variant(person, angle=6),
+        variant(person, zoom=0.9, brightness=-15),
+    ]
+    return person, enrolment, variant(person, angle=-5, brightness=10)
+
+
+def still_fixtures() -> tuple[list[tuple[str, tuple[str, bytes, str]]], bytes]:
+    """Multipart reference parts and a capture, ready for /face/verify-image."""
+    _, enrolment, capture = enrolled_person()
+    refs = [
+        ("images", (f"ref{index}.png", png(image), "image/png"))
+        for index, image in enumerate(enrolment)
+    ]
+    return refs, png(capture)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -80,43 +149,7 @@ def main() -> None:
 
     memory = {"rss_idle_mb": round(rss_mb(), 1)}
 
-    def png(image: np.ndarray) -> bytes:
-        ok, buffer = cv2.imencode(".png", image)
-        assert ok
-        return buffer.tobytes()
-
-    def portrait(image: np.ndarray, size: int = 320) -> np.ndarray:
-        """A tight aligned crop, given the margin a detector expects."""
-        padded = cv2.copyMakeBorder(image, 40, 40, 40, 40, cv2.BORDER_REPLICATE)
-        return cv2.resize(padded, (size, size), interpolation=cv2.INTER_CUBIC)
-
-    def variant(image: np.ndarray, *, angle=0.0, brightness=0, flip=False, zoom=1.0):
-        height, width = image.shape[:2]
-        matrix = cv2.getRotationMatrix2D((width / 2, height / 2), angle, zoom)
-        out = cv2.warpAffine(image, matrix, (width, height), borderMode=cv2.BORDER_REPLICATE)
-        out = cv2.convertScaleAbs(out, alpha=1.0, beta=brightness)
-        return cv2.flip(out, 1) if flip else out
-
-    def clip(image: np.ndarray, frames: int = 40) -> bytes:
-        path = Path(tempfile.mkdtemp()) / "clip.mp4"
-        height, width = image.shape[:2]
-        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 10, (width, height))
-        for index in range(frames):
-            shift = np.float32([[1, 0, 3 * np.sin(index / 4)], [0, 1, 2 * np.cos(index / 5)]])
-            frame = cv2.warpAffine(image, shift, (width, height), borderMode=cv2.BORDER_REPLICATE)
-            writer.write(frame)
-        writer.release()
-        return path.read_bytes()
-
-    person = portrait(get_image("Tom_Hanks_54745"))
-    enrolment = [
-        variant(person),
-        variant(person, flip=True),
-        variant(person, brightness=25),
-        variant(person, angle=6),
-        variant(person, zoom=0.9, brightness=-15),
-    ]
-    capture = variant(person, angle=-5, brightness=10)
+    person, enrolment, capture = enrolled_person()
 
     headers = {"X-API-Key": os.environ["FSA_API_KEYS"].split(",")[0].split(":", 1)[-1]}
     results: dict = {}
