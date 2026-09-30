@@ -7,7 +7,6 @@ are cheap, and that is exactly why they are easy to forget.
 
 from __future__ import annotations
 
-import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Form, Response
@@ -27,11 +26,8 @@ from app.schemas.speech import (
     VoicesResponse,
 )
 from app.schemas.verification import ErrorResponse
-from app.services.media import ensure_content_type
-from app.services.speech.audio import SUPPORTED_CONTAINERS, receive_audio
+from app.services.speech.audio import SUPPORTED_CONTAINERS
 from app.services.speech.tts import MEDIA_TYPE
-
-logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/speech", tags=["speech"])
 
@@ -61,29 +57,15 @@ _GUARDED = {
 )
 async def transcribe(
     caller: GuardDep,
-    settings: SettingsDep,
     service: SttServiceDep,
     form: Annotated[TranscribeForm, Form()],
 ) -> TranscriptionResponse:
-    """Synchronous and bounded: the audio's length is capped, not the caller's patience."""
-    options = service.options_for(form.language)
+    """Synchronous and bounded: the audio's length is capped, not the caller's patience.
 
-    ensure_content_type(form.audio, settings.stt_allowed_audio_types, label="Audio")
-    async with receive_audio(form.audio, max_bytes=settings.stt_max_audio_bytes) as path:
-        result = await service.transcribe(path, options)
-
+    Measured and logged by the service, one event per request whatever its outcome.
+    """
+    result = await service.transcribe_upload(form.audio, language=form.language, caller=caller)
     transcript = result.transcript
-
-    # Never the text: it is what somebody said.
-    logger.info(
-        "transcribe caller=%s container=%s duration=%.1fs language=%s segments=%d in %dms",
-        caller,
-        result.audio.container,
-        result.audio.duration_seconds,
-        transcript.language,
-        len(transcript.segments),
-        result.processing_ms,
-    )
 
     return TranscriptionResponse(
         text=transcript.text,
@@ -123,15 +105,11 @@ async def synthesize(
 ) -> Response:
     """The whole MP3 is in hand before the 200 is sent: a failure is always a JSON error."""
     result = await service.synthesize(
-        text=payload.text, voice=payload.voice, rate=payload.rate, volume=payload.volume
-    )
-
-    logger.info(
-        "synthesize caller=%s voice=%s chars=%d bytes=%d",
-        caller,
-        result.voice,
-        len(payload.text),
-        len(result.audio),
+        text=payload.text,
+        voice=payload.voice,
+        rate=payload.rate,
+        volume=payload.volume,
+        caller=caller,
     )
 
     return Response(

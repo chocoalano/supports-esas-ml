@@ -32,6 +32,7 @@ from app.api.deps import (
     get_challenge_service,
     get_face_engine,
     get_frame_sampler,
+    get_speech_telemetry,
     get_stt_engine,
     get_stt_limiter,
     get_tts_engine,
@@ -253,7 +254,13 @@ def video_payload(
 
 #: Process-wide singletons the speech tests create. Cleared around every test so
 #: none inherits another's engine, or a semaphore sized by another's settings.
-SPEECH_SINGLETONS = (get_stt_engine, get_tts_engine, get_stt_limiter, get_tts_limiter)
+SPEECH_SINGLETONS = (
+    get_stt_engine,
+    get_tts_engine,
+    get_stt_limiter,
+    get_tts_limiter,
+    get_speech_telemetry,
+)
 
 
 @pytest.fixture(autouse=True)

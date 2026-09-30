@@ -82,6 +82,12 @@ class FasterWhisperEngine:
                     device=settings.stt_device,
                     compute_type=settings.stt_compute_type,
                     cpu_threads=settings.stt_cpu_threads,
+                    # One CTranslate2 worker per allowed concurrent transcription.
+                    # With the library's default of 1, concurrent calls queue
+                    # inside the model and FSA_STT_MAX_CONCURRENT > 1 would add
+                    # waiting, not throughput. Threads in use are therefore
+                    # FSA_STT_MAX_CONCURRENT x FSA_STT_CPU_THREADS.
+                    num_workers=max(1, settings.stt_max_concurrent),
                 )
             except Exception as exc:  # pragma: no cover - depends on local models
                 raise SpeechEngineUnavailableError(
@@ -162,15 +168,22 @@ def _model_path(settings: Settings, download_model, *, local_files_only: bool) -
 
 
 def provisioning_problem(settings: Settings) -> str | None:
-    """Why the configured model could not be loaded right now, or None.
+    """Why the configured model could not be loaded right now, as configured, or None.
 
-    For boot: a lookup on disk, never a download and never a model load - it
-    costs milliseconds and no memory beyond importing the library.
+    For boot: whether the device and compute type exist here, and whether the
+    model is on disk - never a download and never a model load. It costs
+    milliseconds and no memory beyond importing the library, and it turns
+    `FSA_STT_DEVICE=cuda` on a host without a GPU into a line in the boot log
+    instead of a 503 on the first transcription.
     """
     try:
+        import ctranslate2
         from faster_whisper.utils import download_model
     except ImportError as exc:
         return f"faster-whisper is not installed ({exc})"
+
+    if problem := _compute_problem(settings, ctranslate2):
+        return problem
 
     try:
         path = _model_path(settings, download_model, local_files_only=True)
@@ -183,4 +196,25 @@ def provisioning_problem(settings: Settings) -> str | None:
     if not (Path(path) / "model.bin").is_file():
         return f"model directory {path} has no model.bin"
 
+    return None
+
+
+def _compute_problem(settings: Settings, ctranslate2) -> str | None:  # noqa: ANN001 - lazy module
+    device = settings.stt_device
+    if device == "auto":
+        device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+    if device == "cuda" and ctranslate2.get_cuda_device_count() == 0:
+        return "FSA_STT_DEVICE=cuda, but no CUDA device is visible to this process"
+
+    try:
+        supported = ctranslate2.get_supported_compute_types(device)
+    except Exception as exc:
+        return f"FSA_STT_DEVICE={settings.stt_device} cannot be used here ({exc})"
+
+    compute = settings.stt_compute_type
+    if compute not in ("default", "auto") and compute not in supported:
+        return (
+            f"FSA_STT_COMPUTE_TYPE={compute} is not supported on {device} "
+            f"(supported: {', '.join(sorted(supported))})"
+        )
     return None

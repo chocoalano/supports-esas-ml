@@ -530,7 +530,7 @@ def test_faster_whisper_is_configured_from_settings(monkeypatch, settings, tmp_p
     assert whisper.resolved == [("base", False, str(tmp_path))]
     ((model, kwargs),) = whisper.constructed
     assert model == whisper.model_dir
-    assert kwargs == {"device": "cpu", "compute_type": "int8", "cpu_threads": 2}
+    assert kwargs == {"device": "cpu", "compute_type": "int8", "cpu_threads": 2, "num_workers": 1}
     assert whisper.transcribed[0]["beam_size"] == 1
     assert whisper.transcribed[0]["vad_filter"] is True
     assert transcript.text == "halo dunia"

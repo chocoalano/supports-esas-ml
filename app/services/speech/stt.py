@@ -16,10 +16,13 @@ from pathlib import Path
 from typing import Protocol
 
 from anyio import Semaphore, to_thread
+from fastapi import UploadFile
 
 from app.core.config import LANGUAGE_CODE, Settings
-from app.core.errors import InvalidSpeechRequestError, LanguageNotSupportedError
-from app.services.speech.audio import AudioInfo, inspect_audio
+from app.core.errors import AppError, InvalidSpeechRequestError, LanguageNotSupportedError
+from app.services.media import ensure_content_type
+from app.services.speech.audio import AudioInfo, inspect_audio, receive_audio
+from app.services.speech.telemetry import INTERNAL_ERROR, LogTelemetry, SpeechTelemetry, SttEvent
 
 logger = logging.getLogger(__name__)
 
@@ -67,11 +70,54 @@ class TranscriptionResult:
 
 class SpeechToTextService:
     def __init__(
-        self, *, engine: SpeechToTextEngine, settings: Settings, limiter: Semaphore
+        self,
+        *,
+        engine: SpeechToTextEngine,
+        settings: Settings,
+        limiter: Semaphore,
+        telemetry: SpeechTelemetry | None = None,
     ) -> None:
         self._engine = engine
         self._settings = settings
         self._limiter = limiter
+        self._telemetry = telemetry or LogTelemetry()
+
+    async def transcribe_upload(
+        self, upload: UploadFile, *, language: str | None, caller: str
+    ) -> TranscriptionResult:
+        """The whole request: language, declared type, upload, validation, engine.
+
+        One place, so every way a request can end - answered, refused, failed,
+        abandoned - is measured once, here, and not in each route that calls it.
+        """
+        settings = self._settings
+        event = SttEvent(
+            caller=caller,
+            provider=settings.stt_provider,
+            model=settings.stt_model,
+            device=settings.stt_device,
+            compute_type=settings.stt_compute_type,
+            in_flight=self._telemetry.begin("stt"),
+        )
+        started = time.perf_counter()
+        try:
+            options = self.options_for(language)
+            event.language = options.language
+            ensure_content_type(upload, settings.stt_allowed_audio_types, label="Audio")
+            async with receive_audio(upload, max_bytes=settings.stt_max_audio_bytes) as path:
+                event.upload_bytes = path.stat().st_size
+                result = await self.transcribe(path, options, event=event)
+            event.outcome, event.status = "ok", 200
+            return result
+        except AppError as exc:
+            event.outcome, event.status = exc.code, exc.status_code
+            raise
+        except Exception:
+            event.outcome, event.status = INTERNAL_ERROR, 500
+            raise
+        finally:
+            event.total_ms = _ms_since(started)
+            self._telemetry.end("stt", event)
 
     def options_for(self, language: str | None) -> TranscribeOptions:
         """Resolve and check the language, before any upload is written or decoded.
@@ -93,19 +139,31 @@ class SpeechToTextService:
 
         return TranscribeOptions(language=effective)
 
-    async def transcribe(self, path: Path, options: TranscribeOptions) -> TranscriptionResult:
+    async def transcribe(
+        self, path: Path, options: TranscribeOptions, *, event: SttEvent | None = None
+    ) -> TranscriptionResult:
+        """Validate and transcribe a file already on disk. `event` collects timings."""
+        event = event or SttEvent(caller="-", provider="-", model="-", device="-", compute_type="-")
         started = time.perf_counter()
 
         # Validation decodes too, so it waits for the same slot as inference:
-        # the Speech runtime does one CPU-bound audio job at a time, whichever
-        # kind. An invalid upload queues behind a transcription, which is the
-        # price of CPU use that stays bounded under a burst of uploads.
+        # CPU-bound audio work in this process is bounded by one number,
+        # FSA_STT_MAX_CONCURRENT, whichever kind of work it is. An invalid
+        # upload queues behind a transcription - the price of CPU use that
+        # stays bounded under a burst of uploads.
         async with self._limiter:
+            event.wait_ms = _ms_since(started)
+            step = time.perf_counter()
             audio = await to_thread.run_sync(
                 partial(inspect_audio, path, max_seconds=self._settings.stt_max_audio_seconds)
             )
+            event.validate_ms = _ms_since(step)
+            event.container, event.audio_seconds = audio.container, audio.duration_seconds
+            step = time.perf_counter()
             transcript = await to_thread.run_sync(self._engine.transcribe, path, options)
+            event.transcribe_ms = _ms_since(step)
 
+        event.language, event.segments = transcript.language, len(transcript.segments)
         if options.language is None:
             # Nothing was asked for, so nothing was checked before inference.
             # The allow-list still means what it says about what comes back.
@@ -125,3 +183,7 @@ class SpeechToTextService:
                 f"Language '{language}' is not supported by this service.",
                 details={"language": language, "allowed": allowed},
             )
+
+
+def _ms_since(started: float) -> int:
+    return int((time.perf_counter() - started) * 1000)

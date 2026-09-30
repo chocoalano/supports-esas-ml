@@ -168,3 +168,62 @@ def test_the_boot_check_is_skipped_when_stt_is_off(monkeypatch):
         pass
 
     assert whisper.resolved == []
+
+
+# -- the device and compute type, as configured ---------------------------------------
+
+
+def test_concurrency_is_real_parallelism_in_the_engine(monkeypatch, settings, tmp_path):
+    """FSA_STT_MAX_CONCURRENT=4 means four transcriptions run, not three wait."""
+    whisper = install_faster_whisper(monkeypatch)
+    clip = tmp_path / "clip"
+    clip.write_bytes(audio_samples.wav())
+    wide = settings.model_copy(update={"stt_max_concurrent": 4, "stt_cpu_threads": 2})
+
+    FasterWhisperEngine(wide).transcribe(clip, TranscribeOptions(language=None))
+
+    ((_, kwargs),) = whisper.constructed
+    assert kwargs["num_workers"] == 4
+    assert kwargs["cpu_threads"] == 2
+
+
+@pytest.mark.parametrize(
+    ("device", "compute_type", "cuda_devices", "complaint"),
+    [
+        ("cuda", "float16", 0, "no CUDA device"),
+        ("cpu", "float16", 0, "FSA_STT_COMPUTE_TYPE=float16 is not supported on cpu"),
+        ("cpu", "int8_float16", 0, "supported: float32, int8, int8_float32"),
+    ],
+)
+def test_a_device_or_compute_type_this_host_lacks_is_named_at_boot(
+    monkeypatch, settings, device, compute_type, cuda_devices, complaint
+):
+    whisper = install_faster_whisper(monkeypatch, cuda_devices=cuda_devices)
+    configured = settings.model_copy(
+        update={"stt_device": device, "stt_compute_type": compute_type}
+    )
+
+    assert complaint in provisioning_problem(configured)
+    assert whisper.constructed == []
+
+
+@pytest.mark.parametrize(
+    ("device", "compute_type", "cuda_devices"),
+    [
+        ("cpu", "int8", 0),
+        ("cpu", "default", 0),
+        ("auto", "int8", 0),
+        ("cuda", "float16", 1),
+        ("auto", "int8_float16", 1),
+    ],
+)
+def test_supported_configurations_pass_the_boot_check(
+    monkeypatch, settings, device, compute_type, cuda_devices
+):
+    """A GPU deployment is a configuration change, and the check agrees with it."""
+    install_faster_whisper(monkeypatch, cuda_devices=cuda_devices)
+    configured = settings.model_copy(
+        update={"stt_device": device, "stt_compute_type": compute_type}
+    )
+
+    assert provisioning_problem(configured) is None

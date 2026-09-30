@@ -32,14 +32,23 @@ class LocalEntryNotFoundError(Exception):
     """What huggingface_hub raises when a model is not cached and it may not download."""
 
 
+#: What CTranslate2 reports a CPU-only build supports.
+CPU_COMPUTE_TYPES = {"int8", "int8_float32", "float32"}
+
+
 def install_faster_whisper(
     monkeypatch: pytest.MonkeyPatch,
     *,
     load_seconds: float = 0.0,
     text: str = " halo dunia ",
     missing: bool = False,
+    cuda_devices: int = 0,
 ) -> WhisperRecord:
-    """`missing=True`: the model is not provisioned and may not be downloaded."""
+    """`missing=True`: the model is not provisioned and may not be downloaded.
+
+    Installs a matching `ctranslate2` too, reporting a CPU-only host unless
+    `cuda_devices` says otherwise.
+    """
     record = WhisperRecord(model_dir=tempfile.mkdtemp(prefix="fsa-stub-model-"))
     (Path(record.model_dir) / "model.bin").write_bytes(b"weights")
     lock = threading.Lock()
@@ -74,6 +83,18 @@ def install_faster_whisper(
     module.utils = utils
     monkeypatch.setitem(sys.modules, "faster_whisper", module)
     monkeypatch.setitem(sys.modules, "faster_whisper.utils", utils)
+
+    def supported_compute_types(device: str) -> set[str]:
+        if device == "cuda":
+            if not cuda_devices:
+                raise ValueError("This CTranslate2 package was not compiled with CUDA support")
+            return CPU_COMPUTE_TYPES | {"float16", "int8_float16"}
+        return set(CPU_COMPUTE_TYPES)
+
+    ctranslate2 = types.ModuleType("ctranslate2")
+    ctranslate2.get_cuda_device_count = lambda: cuda_devices
+    ctranslate2.get_supported_compute_types = supported_compute_types
+    monkeypatch.setitem(sys.modules, "ctranslate2", ctranslate2)
 
     return record
 

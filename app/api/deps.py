@@ -22,6 +22,7 @@ from app.services.face_engine import FaceEngine, InsightFaceEngine
 from app.services.liveness import LivenessService
 from app.services.speech.providers import build_stt_engine, build_tts_engine
 from app.services.speech.stt import SpeechToTextEngine, SpeechToTextService
+from app.services.speech.telemetry import LogTelemetry, SpeechTelemetry
 from app.services.speech.tts import TextToSpeechEngine, TextToSpeechService
 from app.services.verification import VerificationService
 from app.services.video import FrameSampler, OpenCVFrameSampler
@@ -164,6 +165,12 @@ def get_tts_engine() -> TextToSpeechEngine:
 
 
 @lru_cache
+def get_speech_telemetry() -> SpeechTelemetry:
+    """Process-wide: it counts requests in flight. Swap it here for a metrics sink."""
+    return LogTelemetry()
+
+
+@lru_cache
 def get_stt_limiter() -> Semaphore:
     return Semaphore(max(1, get_settings().stt_max_concurrent))
 
@@ -188,20 +195,29 @@ def require_tts(settings: SettingsDep) -> None:
 # without its engine ever being constructed.
 
 
+SpeechTelemetryDep = Annotated[SpeechTelemetry, Depends(get_speech_telemetry)]
+
+
 def get_stt_service(
     settings: SettingsDep,
     _enabled: Annotated[None, Depends(require_stt)],
     engine: Annotated[SpeechToTextEngine, Depends(get_stt_engine)],
+    telemetry: SpeechTelemetryDep,
 ) -> SpeechToTextService:
-    return SpeechToTextService(engine=engine, settings=settings, limiter=get_stt_limiter())
+    return SpeechToTextService(
+        engine=engine, settings=settings, limiter=get_stt_limiter(), telemetry=telemetry
+    )
 
 
 def get_tts_service(
     settings: SettingsDep,
     _enabled: Annotated[None, Depends(require_tts)],
     engine: Annotated[TextToSpeechEngine, Depends(get_tts_engine)],
+    telemetry: SpeechTelemetryDep,
 ) -> TextToSpeechService:
-    return TextToSpeechService(engine=engine, settings=settings, limiter=get_tts_limiter())
+    return TextToSpeechService(
+        engine=engine, settings=settings, limiter=get_tts_limiter(), telemetry=telemetry
+    )
 
 
 TtsEnabledDep = Annotated[None, Depends(require_tts)]

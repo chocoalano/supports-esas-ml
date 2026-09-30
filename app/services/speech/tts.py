@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator
 from contextlib import aclosing
 from dataclasses import dataclass
@@ -36,6 +37,7 @@ from app.core.errors import (
     TtsOutputTooLargeError,
     VoiceNotAvailableError,
 )
+from app.services.speech.telemetry import INTERNAL_ERROR, LogTelemetry, SpeechTelemetry, TtsEvent
 
 logger = logging.getLogger(__name__)
 
@@ -73,11 +75,17 @@ class Synthesis:
 
 class TextToSpeechService:
     def __init__(
-        self, *, engine: TextToSpeechEngine, settings: Settings, limiter: Semaphore
+        self,
+        *,
+        engine: TextToSpeechEngine,
+        settings: Settings,
+        limiter: Semaphore,
+        telemetry: SpeechTelemetry | None = None,
     ) -> None:
         self._engine = engine
         self._settings = settings
         self._limiter = limiter
+        self._telemetry = telemetry or LogTelemetry()
 
     async def synthesize(
         self,
@@ -86,20 +94,45 @@ class TextToSpeechService:
         voice: str | None = None,
         rate: str | None = None,
         volume: str | None = None,
+        caller: str = "-",
     ) -> Synthesis:
-        alias, request = self.prepare(text=text, voice=voice, rate=rate, volume=volume)
+        event = TtsEvent(
+            caller=caller,
+            provider=self._settings.tts_provider,
+            in_flight=self._telemetry.begin("tts"),
+            text_chars=len(text.strip()),
+        )
+        started = time.perf_counter()
+        try:
+            alias, request = self.prepare(text=text, voice=voice, rate=rate, volume=volume)
+            event.voice = alias.id
 
-        async with self._limiter:
-            try:
-                with fail_after(self._settings.tts_timeout_seconds):
-                    audio = await self._collect(request)
-            except TimeoutError as exc:
-                raise SpeechProviderTimeoutError(
-                    "The speech provider did not answer in time.",
-                    details={"timeout_seconds": self._settings.tts_timeout_seconds},
-                ) from exc
+            async with self._limiter:
+                event.wait_ms = _ms_since(started)
+                step = time.perf_counter()
+                try:
+                    with fail_after(self._settings.tts_timeout_seconds):
+                        audio = await self._collect(request)
+                except TimeoutError as exc:
+                    raise SpeechProviderTimeoutError(
+                        "The speech provider did not answer in time.",
+                        details={"timeout_seconds": self._settings.tts_timeout_seconds},
+                    ) from exc
+                finally:
+                    event.synthesize_ms = _ms_since(step)
 
-        return Synthesis(audio=audio, voice=alias.id)
+            event.output_bytes = len(audio)
+            event.outcome, event.status = "ok", 200
+            return Synthesis(audio=audio, voice=alias.id)
+        except AppError as exc:
+            event.outcome, event.status = exc.code, exc.status_code
+            raise
+        except Exception:
+            event.outcome, event.status = INTERNAL_ERROR, 500
+            raise
+        finally:
+            event.total_ms = _ms_since(started)
+            self._telemetry.end("tts", event)
 
     def prepare(
         self, *, text: str, voice: str | None, rate: str | None, volume: str | None
@@ -199,3 +232,7 @@ class TextToSpeechService:
 def _looks_like_mp3(head: bytes) -> bool:
     """ID3 tag or an MPEG audio frame sync. A 200 labelled audio/mpeg is only ever that."""
     return head[:3] == b"ID3" or (len(head) >= 2 and head[0] == 0xFF and head[1] & 0xE0 == 0xE0)
+
+
+def _ms_since(started: float) -> int:
+    return int((time.perf_counter() - started) * 1000)
