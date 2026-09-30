@@ -2,10 +2,12 @@
 
 Laporan kondisi repo ini untuk agen yang baru masuk. Isinya: apa service ini, bentuk
 arsitekturnya, kondisi nyata yang terukur saat laporan dibuat, dan batasan yang **bukan** bug
-tapi keputusan desain. Dokumentasi pengguna yang lengkap ada di `README.md` (896 baris, bahasa
+tapi keputusan desain. Dokumentasi pengguna yang lengkap ada di `README.md` (bahasa
 Indonesia) — file ini tidak menggantikannya, hanya memberi peta supaya tahu ke mana membaca.
 
-Tanggal audit: 2026-09-30. Commit: `f1f002f` (satu commit, branch `main`, working tree bersih).
+Tanggal audit: 2026-09-30. Face/Liveness: commit dasar `f1f002f` di `main`. Modul Speech:
+branch `feature/speech-module` (belum di-merge). Keputusan arsitektur Speech yang mengikat
+ada di `SPEECH_MODULE_PLAN.md` §R — baca sebelum mengubah apa pun di sekitar Speech.
 
 ---
 
@@ -37,6 +39,18 @@ Model: **InsightFace ArcFace** (`buffalo_l`) via ONNX Runtime, embedding 512-d t
 dibandingkan dengan cosine similarity. Bobot diunduh saat pertama kali dipakai ke
 `~/.insightface` (tidak ada di repo; `models/` masuk `.gitignore`).
 
+### Modul Speech
+
+Speech-to-text (faster-whisper) dan text-to-speech (Edge, MP3) di balik Protocol yang tidak
+bergantung penyedia. **Satu codebase, dua runtime**: `FSA_RUNTIME_ROLE` = `face` (default,
+perilaku lama tidak berubah) | `speech` | `all` (dev/test saja). Runtime Speech adalah proses
+sendiri demi isolasi kegagalan, scaling/deployment independen, dan karena PyAV dan OpenCV
+masing-masing membawa FFmpeg sendiri. Semua ukuran (model, device, compute type, konkurensi,
+thread, worker) adalah **konfigurasi deployment**, bukan asumsi kode — aplikasi tidak pernah
+memilih berdasarkan hardware. Pemanggil hanya mengenal alias voice, tidak pernah identifier
+penyedia. Tidak ada model yang diunduh oleh request (`HF_HUB_OFFLINE=1` di produksi, model
+diprovision dengan `scripts/provision_stt_model.py`).
+
 ---
 
 ## 2. Endpoint
@@ -50,7 +64,11 @@ Semua di bawah prefix `FSA_API_PREFIX` (default `/api/v1`).
 | `POST /liveness/challenge` | ✅ | Terbitkan aksi acak bertanda tangan HMAC. |
 | `POST /liveness/verify` | ✅ | Token + video → apakah aksinya dilakukan, berurutan. |
 | `GET /health` | ❌ | Status + apakah model sudah termuat. Sengaja terbuka: yang memanggilnya load balancer/orchestrator, yang tidak punya API key. |
-| `GET /demo`, `GET /` | ❌ | Halaman demo perekam webcam (`static/index.html`, 319 baris). **Harus diblokir di nginx untuk produksi** — checklist go-live di README menuntut endpoint ini menjawab 404. |
+| `GET /demo`, `GET /` | ❌ | Halaman demo perekam webcam (`static/index.html`, 319 baris). **Harus diblokir di nginx untuk produksi** — checklist go-live di README menuntut endpoint ini menjawab 404. Hanya ada di role `face`/`all`. |
+| `POST /speech/transcribe` | ✅ | Multipart `audio` (+ `language`, `include_segments`) → teks. Role `speech`/`all`. |
+| `POST /speech/synthesize` | ✅ | JSON `text`, `voice` (alias), `rate`, `volume` → MP3 langsung di body. |
+| `GET /speech/voices` | ✅ | Alias voice yang dikonfigurasi — tanpa panggilan jaringan. |
+| `GET /speech/capabilities` | ✅ | Batas dan fitur aktif, dari konfigurasi saja. |
 
 Bentuk respons ada di `app/schemas/`. Field yang dimaksudkan untuk di-gate: **`passed`**.
 `match` hanya bernilai true saat `decision is MATCH`; `passed` menambahkan syarat liveness.
@@ -79,11 +97,21 @@ app/
     challenge.py         token HMAC + ACTION_CATALOGUE + ACTION_AXES
     liveness.py          metrik yaw/pitch/mata/mulut + LivenessAnalyzer
     verification.py      pipeline & keputusan (689 baris — file terbesar)
+    speech/
+      audio.py           upload audio tanpa ekstensi + validasi berlapis (PyAV, lazy)
+      stt.py / tts.py    Protocol engine + service (batas, timeout, semaphore, telemetry)
+      telemetry.py       satu event per request speech; sink log, siap untuk sink metrik
+      providers/         faster_whisper.py, edge.py, factory + pemeriksaan kesiapan saat boot
+  api/routes/speech.py   4 route, semuanya di balik GuardDep
+  schemas/speech.py      request ketat (extra="forbid"), respons
+deploy/                  template systemd/nginx/env — contoh, tanpa sizing
+scripts/                 provision_stt_model, smoke_{face,speech,deploy}, benchmark_stt,
+                         build_stt_corpus, linux_validation.sh
 static/index.html
-tests/                   engine & sampler palsu + test HTTP
+tests/                   engine, sampler, dan mesin speech palsu + test HTTP
 ```
 
-Total ±5.000 baris Python termasuk test. Tidak ada Dockerfile, tidak ada config CI.
+Tidak ada Dockerfile, tidak ada config CI (validasi Linux lewat `scripts/linux_validation.sh`).
 
 ### Titik masuk yang perlu diketahui
 
@@ -97,6 +125,12 @@ Total ±5.000 baris Python termasuk test. Tidak ada Dockerfile, tidak ada config
 - **Dua Protocol** (`FaceEngine`, `FrameSampler`) ada supaya test bisa mengganti model. Test
   suite **tidak butuh bobot ONNX**: `tests/conftest.py` membangun landmark 68 titik yang benar
   secara geometris per pose, jadi matematika produksi tetap yang diuji.
+- **Speech**: `SpeechToTextEngine`/`TextToSpeechEngine` (Protocol) → factory di
+  `app/services/speech/providers/__init__.py`. Penyedia baru = satu kelas + satu cabang factory.
+  Mounting per role ada di `create_app()` (`app/main.py`); fitur dimatikan lewat
+  `require_stt`/`require_tts` di `deps.py` yang dideklarasikan **sebelum** engine, sehingga
+  engine tidak pernah dibangun untuk fitur yang mati. Validasi setting Speech
+  (`speech_config_problems`) hanya berjalan bila role melayani Speech.
 
 ---
 
@@ -152,27 +186,29 @@ enrolment rusak disuruh mendekat ke kamera — instruksi yang mustahil dipenuhi.
 
 | Yang diperiksa | Hasil |
 |---|---|
-| `pytest` | **116 passed**, 1 warning, 2,43s |
+| `pytest` (branch Speech) | **385 passed** (116 Face/Liveness tanpa perubahan + 269 Speech), 1 warning |
 | `ruff check .` | **All checks passed** |
+| `pip check` | bersih; menambah Speech tidak menggeser versi paket Face mana pun |
+| Kontrak Face | OpenAPI role `face` **identik byte-per-byte** dengan `f1f002f`; skor `buffalo_l` nyata identik base vs branch, di kedua urutan import cv2/av |
 | Python venv | 3.12.13 (rentang didukung: 3.10–3.12, batasan wheel onnxruntime+insightface) |
-| Git | 1 commit, `main`, working tree bersih |
+| Validasi Linux | **belum dijalankan** — `scripts/linux_validation.sh matrix` di Ubuntu 24.04 x86_64 |
 | `.env` vs `.env.example` | Set key **identik**, tidak ada yang tertinggal |
 | `.env` terisi | `FSA_API_KEYS` dan `FSA_CHALLENGE_SECRET` keduanya terisi |
 
 Versi terpasang, semuanya di dalam rentang `requirements.txt`: fastapi 0.141.1, uvicorn 0.52.4,
 pydantic 2.13.5, numpy 2.2.6, opencv-python-headless 4.14.0.94, onnxruntime 1.29.0,
-insightface 0.7.3.
+insightface 0.7.3; Speech: av 17.1.0, faster-whisper 1.2.1, ctranslate2 4.8.2, edge-tts 7.2.8.
 
 ### Selisih kecil yang ditemukan (tidak ada yang merusak)
 
-1. **`README.md:536` menyebut "90 test", nyatanya 116.** Dokumentasi tertinggal dari suite.
+1. ~~`README.md` menyebut "90 test"~~ — sudah diperbarui ke jumlah sekarang.
 2. **`.env` lokal memakai `FSA_LIVENESS_MAX_SAMPLED_FRAMES=36`, `.env.example` 60.** Ini
    penyetelan sengaja — 36 frame ≈ 11,2s vs 60 frame ≈ 14,9s, dan aman karena pool aksi default
    tidak memuat `blink`. Alasannya terdokumentasi di `config.py`.
 3. **`ApiKeyDep` (`app/api/security.py:89`) tidak dipakai di mana pun.** Route memakai
    `GuardDep`, yang benar karena itu menyertakan rate limit. Alias yang tersisa.
-4. **Tidak ada CI.** `requirements-test.txt` jelas ditulis untuk CI ("Light dependency set for
-   CI"), tapi tidak ada workflow yang memakainya.
+4. **Tidak ada CI**, dan repo ini tidak memakai GitHub Actions. `requirements-test.txt`
+   (tanpa faster-whisper/edge-tts, dengan PyAV) adalah set ringan untuk suite.
 
 ---
 
@@ -199,6 +235,13 @@ Ini semua sudah diketahui, terdokumentasi di `README.md:871`, dan dipilih sadar:
   server.
 - **Lisensi `buffalo_l` non-komersial** (InsightFace). Perlu diperiksa sebelum dipakai di
   produk komersial.
+- **Speech sinkron dan dibatasi.** Panjang audio dibatasi `FSA_STT_MAX_AUDIO_SECONDS` (kebijakan
+  API, bukan hardware); bukan platform transkripsi jangka panjang.
+- **Validasi audio: decoder yang berwenang.** Content-Type yang dideklarasikan hanya lapis
+  kasar (dan sengaja menerima `video/webm`/`application/octet-stream`); nama file tidak pernah
+  dibaca. Lihat `app/services/speech/audio.py`.
+- **422 validasi skema memakai bentuk FastAPI `{"detail": [...]}`**, bukan envelope `error` —
+  konsisten dengan endpoint Face; handler baru sengaja tidak ditambahkan.
 - **Threshold per-request** (`match_threshold`, `min_match_ratio`) bisa dikirim pemanggil karena
   satu deployment melayani beberapa workspace dengan kamera dan pencahayaan berbeda. Hanya dua
   itu yang bisa ditimpa — frame threshold, jendela top-K, dan inconclusive band adalah properti
@@ -217,6 +260,11 @@ make serve         # 2 worker, gaya produksi
 make test          # pytest
 make lint          # ruff check
 make fmt           # ruff check --fix + format
+
+# Speech
+scripts/provision_stt_model.py --env-file <speech.env>   # unduh + verifikasi offline
+scripts/linux_validation.sh matrix|benchmark|staging      # gerbang Linux
+scripts/benchmark_stt.py <korpus> --models base small     # karakteristik model di host ini
 ```
 
 Port default **8001**, bukan 8000: 8000 dipakai Laravel pada pemasangan gabungan.
@@ -244,6 +292,11 @@ membaca komentarnya.
   ini.
 - Error domain selalu turunan `AppError` dengan `code` + `status_code`, supaya bentuk JSON-nya
   konsisten.
+- Log Speech: satu baris `speech.stt|speech.tts key=value` per request dari
+  `app/services/speech/telemetry.py` — tidak pernah audio, transkrip, teks TTS, atau identifier
+  voice penyedia. Error ke pemanggil memakai kode alasan (`details.reason`), detail library ke log.
+- Request Speech ketat: field tidak dikenal → 422. Regex kontrak memakai `fullmatch` (`$` di
+  Python cocok sebelum newline di akhir).
 - Log menyebut **label** kunci API, bukan kuncinya. Perbandingan kunci memakai
   `hmac.compare_digest` atas **bytes** tanpa early exit — keduanya disengaja (timing leak, dan
   byte >127 pada header yang pernah membuat 500 alih-alih 401).

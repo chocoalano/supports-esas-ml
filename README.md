@@ -13,6 +13,9 @@ ada antrean. Satu request masuk → skor keluar, semua file sementara dihapus.
 - **Tertutup secara default.** Setiap endpoint kecuali `/health` menuntut header
   `X-API-Key`, dan tanpa `FSA_API_KEYS` terkonfigurasi servis menolak semuanya — lihat
   [Autentikasi](#autentikasi).
+- **Modul Speech** (opsional, runtime terpisah): speech-to-text dengan faster-whisper dan
+  text-to-speech MP3, di balik kontrak yang tidak bergantung pada penyedianya — lihat
+  [Modul Speech](#modul-speech-stt--tts).
 
 **Jalan cepat**
 
@@ -23,6 +26,7 @@ ada antrean. Satu request masuk → skor keluar, semua file sementara dihapus.
 | Memasangnya dari Laravel | [Integrasi dari Laravel](#integrasi-dari-laravel) |
 | Menaikkan ke server | [Deployment di server](#deployment-di-server) |
 | Menyetel ketat/longgarnya | [Menyetel threshold](#menyetel-threshold) |
+| Speech-to-text / text-to-speech | [Modul Speech](#modul-speech-stt--tts) |
 
 ---
 
@@ -527,13 +531,420 @@ if ($result['passed']) {
 
 ---
 
+## Modul Speech (STT + TTS)
+
+Speech-to-text (rekaman → teks) dan text-to-speech (teks → MP3) dengan kontrak API yang
+tidak bergantung pada penyedia mesinnya. Stateless seperti Face: upload audio hidup selama
+satu request lalu dihapus, dan MP3 hasil sintesis dikembalikan langsung — tidak ada yang
+disimpan, tidak ada URL, tidak ada sesi.
+
+### Arsitektur: satu codebase, dua runtime
+
+```
+                          Laravel
+                             │
+                             ▼
+                   Reverse proxy / load balancer
+                             │
+             ┌───────────────┴────────────────┐
+             ▼                                ▼
+        FACE RUNTIME                     SPEECH RUNTIME  (1..N instance)
+   FSA_RUNTIME_ROLE=face            FSA_RUNTIME_ROLE=speech
+   /face/*  /liveness/*             /speech/*
+        │                                │
+   InsightFace (ONNX)              ┌─────┴─────┐
+                                   ▼           ▼
+                            SpeechToTextEngine  TextToSpeechEngine
+                                   │           │
+                            FasterWhisperEngine  EdgeTtsEngine
+```
+
+`FSA_RUNTIME_ROLE` menentukan router mana yang dipasang proses itu:
+
+| Nilai | Yang dilayani | Dipakai untuk |
+|---|---|---|
+| `face` (default) | `/face/*`, `/liveness/*`, `/demo` | Runtime Face. Perilaku deployment lama tidak berubah sama sekali |
+| `speech` | `/speech/*` | Runtime Speech |
+| `all` | semuanya dalam satu proses | **Development dan test saja** |
+
+Nilai lain membuat aplikasi gagal start. `/api/v1/health` ada di semua role dengan kontrak
+yang sama.
+
+Speech berjalan sebagai proses tersendiri **bukan karena ukuran server**, tapi karena:
+kegagalan yang terisolasi (OOM atau crash di Speech tidak menjatuhkan absensi), scaling dan
+deployment yang independen, semaphore dan batas laju yang tidak dibagi, log yang terpisah,
+dan isolasi native library — PyAV dan OpenCV sama-sama membawa FFmpeg sendiri, dan di
+produksi keduanya tidak pernah berada di satu proses. Request Face yang salah rute ke
+runtime Speech dijawab 404, bukan membuat model wajah termuat di sana.
+
+Kedua runtime bisa berjalan di satu mesin, di dua mesin, atau dengan beberapa instance Speech
+di belakang load balancer — tanpa perubahan kode dan tanpa perubahan kontrak bagi Laravel.
+
+### Endpoint
+
+Semuanya di bawah `FSA_API_PREFIX` dan menuntut `X-API-Key` seperti endpoint Face —
+termasuk dua endpoint `GET`.
+
+#### `POST /api/v1/speech/transcribe`
+
+`multipart/form-data`:
+
+| Field | Wajib | Keterangan |
+|---|---|---|
+| `audio` | ✅ | Rekaman: wav, mp3, aac, m4a/mp4, ogg/opus, flac, webm |
+| `language` | – | Kode ISO 639, mis. `id`. Kosong → `FSA_STT_DEFAULT_LANGUAGE`, atau deteksi otomatis |
+| `include_segments` | – | `true` untuk ikut mengembalikan potongan bertimestamp |
+
+```bash
+curl -s -X POST https://face-api.example.com/api/v1/speech/transcribe \
+  -H "X-API-Key: $SPEECH_KEY" \
+  -F audio=@rekaman.webm -F language=id -F include_segments=true
+```
+
+```json
+{
+  "text": "Selamat pagi, absensi Anda sudah tercatat.",
+  "language": "id",
+  "language_probability": null,
+  "duration_seconds": 3.72,
+  "segments": [{"start": 0.0, "end": 3.5, "text": "Selamat pagi, absensi Anda sudah tercatat."}],
+  "processing_ms": 2104
+}
+```
+
+`language_probability` hanya terisi bila bahasanya dideteksi, bukan diminta.
+`duration_seconds` diukur dengan men-decode audionya, bukan dibaca dari metadata.
+
+#### `POST /api/v1/speech/synthesize`
+
+```bash
+curl -s -X POST https://face-api.example.com/api/v1/speech/synthesize \
+  -H "X-API-Key: $SPEECH_KEY" -H "Content-Type: application/json" \
+  -d '{"text": "Absensi Anda sudah tercatat.", "voice": "default", "rate": "+0%", "volume": "+0%"}' \
+  -o suara.mp3
+```
+
+| Field | Wajib | Keterangan |
+|---|---|---|
+| `text` | ✅ | Maksimal `FSA_TTS_MAX_TEXT_CHARS` karakter setelah di-trim |
+| `voice` | – | Alias dari `/speech/voices`. Kosong → `FSA_TTS_DEFAULT_VOICE` |
+| `rate`, `volume` | – | Tanda + 1–3 digit + `%`, rentang `-100%` … `+100%` |
+
+Respons sukses selalu `200`, `Content-Type: audio/mpeg`, `Content-Length` yang benar, dan
+body MP3 utuh. Header `X-Speech-Voice` berisi **alias** yang dipakai. Tidak ada field
+`format`: keluarannya selalu MP3. Seluruh audio sudah ada di tangan servis sebelum `200`
+dikirim, jadi kegagalan provider selalu berupa error JSON, tidak pernah MP3 terpotong.
+
+#### `GET /api/v1/speech/voices`
+
+Daftar alias yang dikonfigurasi (`FSA_TTS_VOICE_ALIASES`), bukan katalog penyedia — tidak ada
+panggilan jaringan, jadi endpoint ini tidak bisa gagal karena penyedia.
+
+```json
+{
+  "default_voice": "default",
+  "voices": [
+    {"id": "default", "label": "Bahasa Indonesia - Default", "language": "id-ID", "gender": "male"},
+    {"id": "id_male", "label": "Bahasa Indonesia - Pria", "language": "id-ID", "gender": "male"},
+    {"id": "id_female", "label": "Bahasa Indonesia - Wanita", "language": "id-ID", "gender": "female"}
+  ]
+}
+```
+
+#### `GET /api/v1/speech/capabilities`
+
+Batas dan fitur yang aktif, dibaca dari konfigurasi saja — tidak memuat model, tidak
+memanggil jaringan. Field `provider` dan `model` ada untuk operator; **klien tidak boleh
+bercabang berdasarkan keduanya**, karena nilainya berubah ketika mesinnya diganti sementara
+kontraknya tidak.
+
+### Request yang ketat
+
+Field yang tidak dikenal ditolak `422`, baik di JSON maupun multipart: `{"format": "wav"}`
+atau `include_segment=true` (salah ketik) tidak diam-diam diabaikan. 422 dari validasi skema
+memakai bentuk bawaan FastAPI `{"detail": [...]}`, sama seperti endpoint Face; error domain
+memakai `{"error": {"code", "message", "details"}}`.
+
+### Validasi audio
+
+Berlapis, dan hanya decoder yang menjadi otoritas:
+
+| Lapis | Menolak | Otoritas? |
+|---|---|---|
+| Ukuran byte, saat upload ditulis ke disk | `413 payload_too_large` | Ya, mutlak |
+| `Content-Type` yang dideklarasikan (bila ada) | `415 unsupported_media_type` | Tidak — bisa tidak dikirim |
+| Tanda tangan container (byte awal) | `422 invalid_upload` | Tidak — hanya penolakan dini |
+| Decoder PyAV + allow-list demuxer audio | `422 audio_decode_failed` | Ya |
+| Ada stream audio | `422 no_audio_stream` | Ya |
+| Durasi hasil decode, berhenti begitu lewat batas | `422 audio_too_long` | Ya |
+
+Nama file dari pemanggil tidak pernah menentukan apa pun — file sementara ditulis tanpa
+ekstensi. `Content-Type` default yang diterima termasuk `video/webm` dan
+`application/octet-stream`, karena itulah yang dikirim klien HTTP berdasarkan ekstensi
+(Guzzle di balik `Http::attach()` Laravel mengirim `.webm` sebagai `video/webm`); lapis itu
+bukan batas keamanan.
+
+### Voice alias
+
+Pemanggil hanya mengenal alias (`default`, `id_male`, `id_female`, …). Identifier milik
+penyedia — misalnya `id-ID-ArdiNeural` — tidak pernah muncul di request, respons, header,
+maupun error, dan dikirim sebagai `voice` pun ditolak `422 voice_not_available`. Pindah
+penyedia berarti mengubah `FSA_TTS_VOICE_ALIASES`, bukan Laravel atau aplikasi mobile.
+
+```dotenv
+FSA_TTS_DEFAULT_VOICE=default
+FSA_TTS_VOICE_ALIASES=[{"id":"default","provider_voice":"id-ID-ArdiNeural","label":"Bahasa Indonesia - Default","language":"id-ID","gender":"male"},{"id":"id_female","provider_voice":"id-ID-GadisNeural","label":"Bahasa Indonesia - Wanita","language":"id-ID","gender":"female"}]
+```
+
+JSON satu baris, bukan CSV: tiap alias punya lima field dan salah satunya teks bebas.
+
+### Konfigurasi Speech
+
+Semua setting Speech hanya divalidasi bila role melayani Speech — salah ketik di sini tidak
+pernah bisa menghentikan runtime Face. Di runtime Speech, nilai yang tidak valid membuat
+proses gagal start dengan pesan yang menyebut nama env var-nya (tanpa pernah mencetak nilai
+setting lain seperti kunci API).
+
+| Var | Default | Fungsi |
+|---|---|---|
+| `FSA_RUNTIME_ROLE` | `face` | `face` \| `speech` \| `all` |
+| `FSA_STT_ENABLED` / `FSA_TTS_ENABLED` | `false` | Fitur mati → `503 stt_disabled` / `tts_disabled` |
+| **Mesin STT** | | |
+| `FSA_STT_PROVIDER` | `faster_whisper` | Implementasi `SpeechToTextEngine` |
+| `FSA_STT_MODEL` | `small` | Nama model (`tiny`, `base`, `small`, `medium`, `large-v3`, …, atau repo `org/model`), **atau path absolut** direktori model yang sudah diprovision |
+| `FSA_STT_MODEL_ROOT` | cache HuggingFace | Direktori persisten tempat model disimpan |
+| `FSA_STT_DEVICE` | `cpu` | `cpu`, `cuda`, `auto` |
+| `FSA_STT_COMPUTE_TYPE` | `int8` | Sesuai kemampuan device: `int8`, `int8_float32`, `float32` (CPU); `float16`, `int8_float16` (GPU) |
+| `FSA_STT_BEAM_SIZE` / `FSA_STT_VAD_FILTER` | `1` / `true` | Parameter decoding, tidak diekspos ke pemanggil |
+| **Kapasitas STT per worker** | | |
+| `FSA_STT_MAX_CONCURRENT` | `1` | Transkripsi yang berjalan paralel; mesin dibuat dengan jumlah worker yang sama |
+| `FSA_STT_CPU_THREADS` | `0` | Thread per transkripsi (`0` = default library) |
+| `FSA_STT_WARM_UP_ON_STARTUP` | `false` | Muat model saat start, bukan saat transkripsi pertama |
+| **Kebijakan API STT** | | |
+| `FSA_STT_MAX_AUDIO_BYTES` | `26214400` | Batas ukuran upload |
+| `FSA_STT_MAX_AUDIO_SECONDS` | `300` | Batas durasi, diukur dengan decode |
+| `FSA_STT_DEFAULT_LANGUAGE` | — | Kosong = deteksi. Whisper sering mengira bahasa Indonesia sebagai Melayu |
+| `FSA_STT_ALLOWED_LANGUAGES` | — | Kosong = semua; berlaku untuk bahasa yang diminta dan yang terdeteksi |
+| `FSA_STT_ALLOWED_AUDIO_TYPES` | 20 tipe | Content-Type yang boleh dideklarasikan |
+| **TTS** | | |
+| `FSA_TTS_PROVIDER` | `edge` | Implementasi `TextToSpeechEngine` |
+| `FSA_TTS_DEFAULT_VOICE` / `FSA_TTS_VOICE_ALIASES` | `default` / 3 alias | Lihat [Voice alias](#voice-alias) |
+| `FSA_TTS_DEFAULT_RATE` / `FSA_TTS_DEFAULT_VOLUME` | `+0%` | |
+| `FSA_TTS_MAX_TEXT_CHARS` | `3000` | Teks lebih panjang → `413` |
+| `FSA_TTS_MAX_OUTPUT_BYTES` | `10485760` | Output penyedia di atas ini → `502 tts_output_too_large` |
+| `FSA_TTS_TIMEOUT_SECONDS` | `30` | Batas waktu satu sintesis → `504` |
+| `FSA_TTS_MAX_CONCURRENT` | `4` | Sintesis paralel per worker |
+
+Semaphore Face, STT, dan TTS adalah tiga objek terpisah; `FSA_MAX_CONCURRENT_INFERENCES`
+tetap hanya milik Face.
+
+### Menyediakan model (provisioning)
+
+Model **tidak pernah diunduh oleh request**. Runtime Speech produksi berjalan dengan
+`HF_HUB_OFFLINE=1`; model yang belum ada di disk membuat transkripsi langsung ditolak
+`503 speech_engine_unavailable` dengan `details.reason = model_not_provisioned` (dalam
+puluhan milidetik, tanpa menunggu timeout jaringan), dan log saat start sudah menyebut apa
+yang kurang.
+
+**Cara 1 — berdasarkan nama.** Langkah deployment yang boleh mengakses internet:
+
+```bash
+sudo -u faceapi /opt/face-api/venv/bin/python scripts/provision_stt_model.py \
+    --env-file /opt/face-api/speech.env
+```
+
+Skrip membaca `FSA_STT_MODEL` dan `FSA_STT_MODEL_ROOT` dari file env yang sama dengan
+service, mengunduh ke root itu, lalu — di proses terpisah dengan `HF_HUB_OFFLINE=1` —
+menjalankan pemeriksaan start milik service, memuat model lewat engine service, dan
+mentranskripsi satu detik audio. Exit 0 berarti service akan menemukan dan memuat model ini
+secara offline. Keluarannya mencatat path dan SHA-256 `model.bin`.
+
+**Cara 2 — artefak yang sudah diprovision.** Setel `FSA_STT_MODEL` ke path absolut direktori
+model CTranslate2 (berisi `model.bin`, `config.json`, `tokenizer.json`, `vocabulary.*`) lalu
+verifikasi dengan `--verify-only`. Opsional, sebagai optimasi deployment: model yang
+**dikonversi ke int8 lebih dulu** memuat lebih cepat dan memakai memori jauh lebih sedikit
+setelah load dibanding model float16 yang dikonversi ulang setiap start, dengan transkrip
+yang identik. Konversi dilakukan sekali **di luar server** (butuh `transformers` + `torch`,
+yang tidak termasuk dependency produksi):
+
+```bash
+pip install "ctranslate2==4.8.2" "transformers[torch]"
+ct2-transformers-converter --model openai/whisper-small --quantization int8 \
+    --output_dir whisper-small-int8 --copy_files tokenizer.json preprocessor_config.json
+# salin direktori itu ke server, lalu: FSA_STT_MODEL=/opt/face-api/models/stt/whisper-small-int8
+```
+
+Simpan model di direktori persisten yang dinamai `FSA_STT_MODEL_ROOT` — bukan `/tmp`, bukan
+direktori home sementara. Pemeriksaan saat start juga memastikan `FSA_STT_DEVICE` dan
+`FSA_STT_COMPUTE_TYPE` tersedia di host itu, jadi `cuda` di mesin tanpa GPU tertulis di log
+start, bukan baru ketahuan sebagai 503.
+
+### Scaling
+
+Semua scaling lewat konfigurasi; aplikasi tidak pernah memilih sendiri berdasarkan hardware.
+
+- **Vertikal.** Tambah CPU: naikkan `FSA_STT_MAX_CONCURRENT` dan/atau `FSA_STT_CPU_THREADS`
+  (thread per worker = keduanya dikalikan). GPU: `FSA_STT_DEVICE=cuda` +
+  `FSA_STT_COMPUTE_TYPE=float16`. Model lain: `FSA_STT_MODEL`. Jumlah proses: `WEB_CONCURRENCY`
+  (variabel uvicorn); tiap proses memuat model sendiri dan punya semaphore serta penghitung
+  batas laju sendiri.
+- **Horizontal.** Runtime Speech stateless — tanpa database, tanpa sesi, tanpa file yang
+  bertahan — sehingga beberapa instance bisa berdiri di belakang load balancer tanpa sticky
+  session. Tambah baris `server` di `upstream fsa_speech`.
+- **Penyedia lain.** STT dan TTS masing-masing adalah Protocol (`SpeechToTextEngine`,
+  `TextToSpeechEngine`) dengan satu factory di `app/services/speech/providers/`. Penyedia baru
+  (OpenAI, Azure, Google, ElevenLabs, model lokal lain) = satu kelas + satu cabang factory +
+  nilai baru di `FSA_STT_PROVIDER`/`FSA_TTS_PROVIDER`. Endpoint, skema, validasi, dan batas
+  tidak berubah.
+
+`FSA_RATE_LIMIT_PER_MINUTE` dihitung per proses, seperti di Face; batas yang berlaku lintas
+worker dan instance tempatnya di reverse proxy (zona `speech` di `deploy/nginx`).
+
+### Observability
+
+Tiap request Speech menghasilkan **tepat satu** baris log terstruktur (`key=value`) — sukses,
+ditolak, gagal, maupun ditinggal pemanggil (`cancelled`, status 499):
+
+```
+speech.stt outcome=ok status=200 caller=laravel provider=faster_whisper model=small device=cpu compute_type=int8 in_flight=1 upload_bytes=308172 container=wav audio_seconds=9.629 language=id segments=2 wait_ms=0 validate_ms=5 transcribe_ms=4646 total_ms=4653
+speech.tts outcome=ok status=200 caller=laravel provider=edge in_flight=1 voice=default text_chars=42 output_bytes=22320 wait_ms=0 synthesize_ms=1100 total_ms=1100
+speech.stt outcome=audio_too_long status=422 caller=laravel ... audio_seconds=- transcribe_ms=- total_ms=41
+```
+
+`wait_ms` adalah waktu antre menunggu slot (`FSA_STT_MAX_CONCURRENT`) — angka pertama yang
+dilihat saat request mulai lambat. Isi audio, transkrip, dan teks TTS **tidak pernah** ditulis;
+TTS hanya mencatat panjangnya, dan voice hanya aliasnya. Error sisi server (5xx) ditulis pada
+level WARNING/ERROR, penolakan (4xx) pada INFO.
+
+Event dibuat di service layer (`app/services/speech/telemetry.py`), dan tujuannya adalah
+sebuah Protocol: sink metrik (misalnya Prometheus: `stt_requests_total`,
+`stt_duration_seconds`, `stt_audio_seconds`, `stt_active_requests`, `tts_requests_total`,
+`speech_errors_total`) cukup ditambahkan sebagai implementasi kedua lewat
+`get_speech_telemetry`, tanpa menyentuh route maupun provider.
+
+### Karakteristik model
+
+Diukur dengan `scripts/benchmark_stt.py` pada 19 klip suara manusia berbahasa Indonesia (12
+menit: pria, wanita, bising ringan, campuran istilah Inggris, 30–300 detik) dari FLEURS dan
+LibriVox Indonesia, `int8`, **1 thread, Apple M2**. Akurasi berlaku di host mana pun (model dan
+compute type yang sama menghasilkan teks yang sama); latensi dan memori milik host ini —
+jalankan skripnya di host target untuk angka host itu.
+
+| Model | WER / CER | Memori setelah load | Puncak memori proses | Latensi ≈ tetap + per detik audio | 300 s audio |
+|---|---|---|---|---|---|
+| `tiny` | 0,55 / 0,19 | 268 MB | 526 MB | 0,3 s + 0,050 s | 17 s |
+| `base` | 0,39 / 0,13 | 374 MB | 573 MB | 0,0 s + 0,115 s | 39 s |
+| `small` | **0,24 / 0,08** | 759 MB | 799 MB | 2,2 s + 0,230 s | 73 s |
+| `small`, artefak int8 | 0,24 / 0,08 (identik) | 349 MB | 692 MB | 2,0 s + 0,259 s | 83 s |
+
+Catatan kualitas dari membaca transkripnya: `tiny` tidak layak pakai; `base` menghilangkan
+bagian ucapan pada audio panjang (216 dari 272 kata pada klip 180 s) dan salah membaca angka;
+`small` menangkap angka dan sebagian besar istilah Inggris dengan benar. Korpusnya ucapan yang
+dibaca, bukan percakapan — kualitas pada percakapan nyata perlu diukur dengan rekaman
+percakapan.
+
+### Deployment
+
+Template di `deploy/` — contoh, bukan keputusan sizing:
+
+| Berkas | Isi |
+|---|---|
+| `deploy/systemd/fsa-face.service` | Unit Face yang sama dengan [systemd](#4-systemd) di atas, ditambah role yang dipatok |
+| `deploy/systemd/fsa-speech.service` | Runtime Speech: working directory dan env file sendiri (tidak pernah membaca `.env` Face), `HF_HUB_OFFLINE=1`, tanpa jumlah worker atau batas resource |
+| `deploy/systemd/fsa-speech.service.d/limits.conf.example` | **Opsional**: contoh `MemoryMax`, `CPUWeight`, `OOMScoreAdjust` — diisi berdasarkan pengukuran di host itu |
+| `deploy/env/speech.env.example` | Setting runtime Speech, dikelompokkan: mesin, kapasitas, kebijakan API |
+| `deploy/nginx/fsa-zones.conf` | Dua zona `limit_req` (Face dan Speech tidak pernah berbagi jatah) dan upstream |
+| `deploy/nginx/fsa.conf` | Rute ke kedua runtime; `/speech/` dengan `client_max_body_size 32m` dan `proxy_read_timeout 120s`; selain rute API → 404 |
+
+Urutannya: pasang dependency (`requirements.txt`), provision model, isi `speech.env`, pasang
+unit dan konfigurasi nginx, lalu jalankan `scripts/smoke_deploy.py` terhadap deployment itu —
+ia memeriksa isolasi rute kedua runtime, kontrak `/health`, setiap kasus STT/TTS, pemisahan
+jatah batas laju, dan (dengan `--systemd`, di host uji) stop/kill/restart Speech sambil Face
+dipanggil serta `strace` yang membuktikan transkripsi tidak membuka koneksi keluar.
+
+`scripts/linux_validation.sh` menjalankan gerbang kompatibilitas di Linux: per versi Python,
+install penuh, perbandingan versi paket dengan install Face-only commit dasar, test, dan smoke
+nyata Face (skor identik dengan commit dasar) dan Speech.
+
+### Integrasi Speech dari Laravel
+
+```php
+use Illuminate\Support\Facades\Http;
+
+$base = config('services.speech_api.url');
+$speech = Http::withHeader('X-API-Key', config('services.speech_api.key'))
+    ->timeout(130);   // sedikit di atas proxy_read_timeout nginx (120 s)
+
+// Speech-to-text
+$result = $speech->asMultipart()
+    ->attach('audio', fopen($path, 'r'), basename($path))
+    ->post("{$base}/api/v1/speech/transcribe", ['language' => 'id'])
+    ->throw()
+    ->json();
+
+$text = $result['text'];
+
+// Text-to-speech: body respons adalah MP3-nya. Menyimpannya urusan Laravel.
+$response = $speech->post("{$base}/api/v1/speech/synthesize", [
+    'text' => 'Absensi Anda sudah tercatat.',
+    'voice' => 'default',
+]);
+
+if ($response->successful()) {
+    Storage::disk('local')->put("tts/{$id}.mp3", $response->body());
+} else {
+    $code = $response->json('error.code');   // bercabang pada kode, bukan pada pesan
+}
+```
+
+Yang perlu dibedakan pemanggil: `502 speech_provider_failed`, `504 speech_provider_timeout`
+(penyedia TTS bermasalah — boleh dicoba lagi), `503 speech_engine_unavailable`,
+`stt_disabled`, `tts_disabled` (masalah konfigurasi server), `429` (kurangi laju), dan `422`
+(permintaannya yang salah — jangan diulang tanpa diubah).
+
+### Kode error Speech
+
+| Status | `code` | Kapan |
+|---|---|---|
+| 413 | `payload_too_large` | Audio di atas `FSA_STT_MAX_AUDIO_BYTES`, atau teks di atas `FSA_TTS_MAX_TEXT_CHARS` |
+| 415 | `unsupported_media_type` | Content-Type yang dideklarasikan tidak diizinkan |
+| 422 | `invalid_upload` | Upload kosong, atau byte awalnya bukan container audio |
+| 422 | `audio_decode_failed` | Decoder tidak bisa membacanya sebagai audio |
+| 422 | `no_audio_stream` | Container sah tanpa audio (mis. MP4 video saja) |
+| 422 | `audio_too_long` | Lebih panjang dari `FSA_STT_MAX_AUDIO_SECONDS` |
+| 422 | `language_not_supported` | Di luar `FSA_STT_ALLOWED_LANGUAGES`, atau tidak didukung model |
+| 422 | `invalid_request` | Teks kosong, `rate`/`volume`/`language` tidak sesuai kontrak |
+| 422 | `voice_not_available` | Bukan alias yang dikonfigurasi |
+| 502 | `speech_provider_failed` | Penyedia TTS gagal, mengirim 0 byte, atau bukan MP3 |
+| 502 | `tts_output_too_large` | Output penyedia di atas `FSA_TTS_MAX_OUTPUT_BYTES` |
+| 503 | `stt_disabled` / `tts_disabled` | Fitur dimatikan |
+| 503 | `speech_engine_unavailable` | `details.reason`: `model_not_provisioned`, `engine_not_installed`, `engine_failed_to_load`, `decoder_not_installed` |
+| 504 | `speech_provider_timeout` | Penyedia TTS melewati `FSA_TTS_TIMEOUT_SECONDS` |
+
+Detail teknis (library, device, path) hanya ada di log, tidak di respons.
+
+### Troubleshooting
+
+| Gejala | Penyebab & perbaikan |
+|---|---|
+| `404` di `/speech/*` | Proses berjalan dengan role `face`, atau request mendarat di runtime Face. Cek `FSA_RUNTIME_ROLE` dan rute reverse proxy |
+| `503` `model_not_provisioned` | Model belum ada di `FSA_STT_MODEL_ROOT`. Jalankan `scripts/provision_stt_model.py`; request berikutnya langsung berhasil, tanpa restart |
+| `503` `engine_failed_to_load` | Kombinasi device/compute type tidak didukung host itu (mis. `cuda` tanpa GPU, `float16` di CPU). Log start menyebut setting mana |
+| Log start `Invalid speech configuration: …` | Setting Speech tidak valid; pesan menyebut env var-nya |
+| `415` untuk file yang sah | Klien mengirim Content-Type yang tidak ada di `FSA_STT_ALLOWED_AUDIO_TYPES` — tambahkan, atau jangan kirim header itu |
+| `422 audio_decode_failed` untuk rekaman dari aplikasi | File terpotong/rusak saat upload; cek `upload_bytes` di log |
+| Transkripsi lambat | Lihat `wait_ms` (antre slot) vs `transcribe_ms` (mesin) di log; lalu atur kapasitas lewat konfigurasi |
+| `504 speech_provider_timeout` berulang | Penyedia TTS lambat/tidak terjangkau dari server; cek jaringan keluar |
+
+---
+
 ## Testing
 
 Suite memakai engine palsu, jadi tidak perlu mengunduh model:
 
 ```bash
 make install-test    # atau: pip install -r requirements-test.txt
-make test            # 90 test
+make test            # 385 test: 116 Face/Liveness, 269 Speech
 make lint
 ```
 
@@ -547,6 +958,15 @@ per kunci, dan ambang per-permintaan yang mengubah putusan.
 
 Engine palsu membangun landmark 68 titik yang **benar secara geometris** untuk tiap pose,
 jadi yang diuji tetap matematika produksi — hanya jaringan sarafnya yang diganti.
+
+Untuk Speech, mesin STT/TTS diganti tiruan (tidak perlu faster-whisper, edge-tts, maupun
+jaringan), tapi validator audionya asli: PyAV ada di `requirements-test.txt` dan file uji
+di-encode FFmpeg saat test berjalan, termasuk WebM tanpa durasi seperti hasil MediaRecorder.
+Yang dicakup: setiap lapis validasi audio, kontrak request yang ketat, batas `rate`/`volume`,
+alias voice, perilaku penyedia yang gagal/lambat/berlebihan, isolasi role (termasuk bukti di
+proses terpisah bahwa runtime Speech tidak pernah memuat OpenCV/InsightFace dan runtime Face
+tidak pernah memuat PyAV/faster-whisper/edge-tts), semaphore yang terpisah, provisioning dan
+mode offline, konkurensi mesin, dan telemetry (satu event per request, tanpa isi ucapan).
 
 ---
 
@@ -573,6 +993,16 @@ app/
     media.py               baca upload dengan batas ukuran, decode gambar, file sementara
     video.py               sampling frame OpenCV (memori terbatas)
     verification.py        logika perbandingan & keputusan
+    speech/
+      audio.py             terima upload audio, validasi berlapis dengan PyAV
+      stt.py               Protocol SpeechToTextEngine + SpeechToTextService
+      tts.py               Protocol TextToSpeechEngine + TextToSpeechService
+      telemetry.py         satu event per request speech; sink log (atau metrik)
+      providers/           faster_whisper.py, edge.py, dan factory-nya
+  api/routes/speech.py     /speech/transcribe, /synthesize, /voices, /capabilities
+  schemas/speech.py        kontrak request/respons Speech (ketat)
+deploy/                    template systemd, nginx, env (contoh, bukan sizing)
+scripts/                   provisioning model, smoke test, benchmark, validasi Linux
 static/index.html          halaman demo perekam webcam
 tests/                     engine & sampler palsu + test HTTP
 ```
@@ -586,6 +1016,8 @@ video hanya di-decode dan dideteksi **sekali** untuk kedua pemeriksaan.
 ## Deployment di server
 
 Tidak ada Docker di repo ini — jalankan langsung sebagai service Python di belakang nginx.
+Bagian ini tentang runtime Face; runtime Speech dipasang terpisah dengan template di
+`deploy/` — lihat [Modul Speech → Deployment](#deployment).
 Contoh berikut untuk Ubuntu 22.04/24.04, dengan servis mendengarkan di `127.0.0.1:8001`
 dan nginx sebagai satu-satunya yang menghadap keluar.
 
@@ -894,3 +1326,11 @@ membuat permintaan tanpa kunci dilayani.
   lisensinya sebelum dipakai di produk komersial.
 - Data biometrik: meski tidak ada yang disimpan di sini, log akses dan aturan retensi tetap
   jadi tanggung jawab aplikasi pemanggil.
+- **Speech sinkron.** Satu transkripsi dijawab dalam request yang sama; panjangnya dibatasi
+  `FSA_STT_MAX_AUDIO_SECONDS`, bukan kesabaran pemanggil. Ini bukan platform transkripsi
+  jangka panjang.
+- **TTS memakai layanan online Microsoft Edge.** Teks yang disintesis dikirim ke penyedia
+  itu; untuk teks yang tidak boleh keluar, konfigurasikan penyedia lain di balik Protocol
+  yang sama.
+- **Akurasi STT diukur pada ucapan yang dibaca**, bukan percakapan. Ukur ulang dengan
+  rekaman dari penggunaan nyata sebelum mengandalkan angka WER di atas.

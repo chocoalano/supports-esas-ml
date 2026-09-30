@@ -1,7 +1,7 @@
 # Implementation Plan — Modul Speech (STT + TTS)
 
-Status (2026-09-30): **Revisi 3 — ADR terkunci, implementasi langkah 1–12 selesai.**
-Produksi **belum** disetujui; lihat §R.5 untuk gerbang yang tersisa. Bagian §A–§M di bawah
+Status (2026-09-30): **Revisi 3 — ADR terkunci, implementasi selesai; koreksi scope §R.3.**
+Gerbang merge yang tersisa: kompatibilitas Linux (§R.6). Bagian §A–§M di bawah
 adalah Revisi 2 dan dibiarkan sebagai catatan; bila bertentangan dengan §R, **§R yang berlaku.**
 
 ---
@@ -17,7 +17,7 @@ adalah Revisi 2 dan dibiarkan sebagai catatan; bila bertentangan dengan §R, **�
 | 3 | **Dua decode**; Protocol tetap `transcribe(path, options)` | `inspect_audio` (validasi) + faster-whisper (decode sendiri) |
 | 4 | `FSA_RUNTIME_ROLE` = `face` \| `speech` \| `all`, default `face`, fail-fast | `RuntimeRole`, mounting di `create_app()` |
 | 5 | `small` + int8 = **baseline benchmark**, bukan keputusan produksi | default `FSA_STT_MODEL=small` |
-| 6 | Timeout berlapis: nginx 120 s, Laravel 130 s. Lambat → turunkan cap durasi dulu | `FSA_STT_MAX_AUDIO_SECONDS`; skrip benchmark memprediksi biaya pada cap |
+| 6 | Timeout berlapis: nginx 120 s, Laravel 130 s; sinkron dan dibatasi | `FSA_STT_MAX_AUDIO_SECONDS` = kebijakan API yang dapat dikonfigurasi (§R.3), bukan angka hardware |
 | + | Request strict: field tak dikenal → 422 (JSON **dan** multipart) | `extra="forbid"` pada `SynthesizeRequest` dan `TranscribeForm` |
 | + | `rate`/`volume`: sintaks **dan** rentang −100..+100 | `parse_prosody_percent` |
 | + | `Content-Disposition: inline; filename="speech.mp3"` | route synthesize |
@@ -57,95 +57,107 @@ adalah Revisi 2 dan dibiarkan sebagai catatan; bila bertentangan dengan §R, **�
     hari ini; handler baru tidak ditambahkan (§I.3). Galat semantik (`invalid_request`,
     `voice_not_available`, dst.) memakai envelope.
 
-### R.3 Temuan operasional (wajib masuk deployment)
+### R.3 Koreksi scope (2026-09-30) — mengikat
 
-- **Model diunduh saat request pertama bila belum ada** — terukur 79,7 s untuk `small`. Di
-  produksi: unduh model saat provisioning ke `FSA_STT_MODEL_ROOT`, lalu set `HF_HUB_OFFLINE=1`
-  di unit Speech supaya runtime tidak pernah menghubungi huggingface.co.
-- `client_max_body_size` nginx untuk `/api/v1/speech/` harus ≥ `FSA_STT_MAX_AUDIO_BYTES`
-  (+ overhead multipart), mis. `26m`.
-- Rate limit in-process di mode `all` tetap satu bucket bersama (keterbatasan dev yang sudah
-  diketahui); isolasi rate budget produksi = dua proses + dua zona nginx.
+Tugasnya adalah **Speech Service yang benar, modular, scalable, configurable, dan tidak merusak
+Face/Liveness** — bukan capacity planning. Setiap keputusan software harus tetap benar di
+server 2 GB maupun 16 GB, CPU maupun GPU, satu instance maupun banyak.
 
-### R.4 Status langkah implementasi (urutan dari ADR)
+| In scope | Out of scope |
+|---|---|
+| arsitektur software, desain API, abstraksi provider | sizing hardware, rekomendasi RAM/CPU |
+| konfigurasi, keamanan, scaling stateless | swap, OOM, PHP-FPM tuning |
+| uji kompatibilitas, template deployment | audit server produksi |
 
-| # | Langkah | Status |
-|---|---|---|
-| 1–9 | errors, Settings + `FSA_RUNTIME_ROLE`, `.env.example`, validasi audio, service, schema strict, fake, test isolasi/lazy/role, routes/deps/mounting | ✅ |
-| 10 | provider faster-whisper | ✅ + verifikasi nyata (macOS): transkrip Indonesia tepat |
-| 11 | provider Edge | ✅ + verifikasi nyata: ketiga alias, jalur timeout & output-cap |
-| 12 | dependency | ✅ `pip check` bersih; tidak satu pun paket Face berubah versi |
-| 13 | Matrix Linux py3.10/3.11/3.12 | ⏳ **belum** — tidak ada Linux/Docker di mesin ini |
-| 14 | Benchmark nyata | ⏳ alat siap: `scripts/benchmark_stt.py` (§R.6) |
-| 15 | Model produksi + `MemoryMax` | ⏳ menunggu 14 |
-| 16 | README / AGENTS | ⏳ sengaja setelah 15 |
-| 17 | systemd / nginx | ⏳ `MemoryMax=<hasil capacity planning>` |
-| 18 | Smoke produksi | ⏳ |
+Akibatnya:
 
-Bukti regresi saat ini: OpenAPI runtime `role=face` **byte-identik** dengan commit `f1f002f`;
-tidak satu pun berkas Face/Liveness, `security.py`, `throttle.py`, atau test lama berubah.
+- **Tidak ada keputusan hardware di kode maupun template.** Tidak ada `if RAM < …`, tidak ada
+  jumlah worker, `MemoryMax`, `CPUWeight`, atau `OOMScoreAdjust` sebagai requirement.
+  Template systemd tidak menetapkan worker (uvicorn membaca `WEB_CONCURRENCY`); batas resource
+  hanya ada di `limits.conf.example` yang opsional dan dikomentari.
+- **Face tidak disentuh** — kode, kontrak, security, throttle, versi dependency, dan juga
+  konfigurasi deployment-nya (jumlah worker, konkurensi, kebijakan OOM).
+- **Isolasi runtime tetap** (`FSA_RUNTIME_ROLE`), dengan alasan arsitektur: isolasi kegagalan,
+  scaling/deployment/konkurensi/observability/batas laju yang independen, isolasi dependency
+  dan native library (PyAV/OpenCV).
+- **Semua kapasitas lewat konfigurasi eksplisit:** `FSA_STT_MODEL`, `FSA_STT_DEVICE`,
+  `FSA_STT_COMPUTE_TYPE`, `FSA_STT_MODEL_ROOT`, `FSA_STT_MAX_CONCURRENT`, `FSA_STT_CPU_THREADS`,
+  `WEB_CONCURRENCY`. `small`/`int8`/1 hanyalah default awal.
+- **`FSA_STT_MAX_AUDIO_SECONDS` adalah kebijakan API**, bukan hardware; tetap `300` sampai
+  ada kebutuhan bisnis lain. Pipeline tetap: batas byte + durasi hasil decode + early abort.
+- **Model pre-converted int8 = optimasi deployment yang didukung, bukan kewajiban.**
+  Konversi di luar server; torch tidak pernah menjadi dependency produksi.
+- **Benchmark hanya menghasilkan karakteristik** (latensi, RTF, memori, akurasi per model);
+  tim infrastruktur yang menurunkan sizing darinya.
+- Validasi Linux tetap diperlukan, **sebagai gerbang kompatibilitas software**, bukan capacity
+  benchmark.
 
-### R.5 Gerbang produksi yang tersisa
+### R.4 Keputusan software setelah koreksi scope
 
-Linux matrix hijau (install + `pip check` + import `av`/`faster_whisper`/`edge_tts`/`cv2` +
-`make test` + satu verifikasi Face nyata) · regresi penuh hijau · benchmark memori & latency
-di host target · model produksi dipilih · `MemoryMax` ditetapkan dari peak RSS · unit systemd
-terpisah aktif · zona nginx terpisah aktif · isolasi role terbukti di host · smoke Face hijau.
+1. **Batas instrumentasi di service layer** (`app/services/speech/telemetry.py`): satu
+   `SttEvent`/`TtsEvent` per request — sukses, ditolak (dengan kodenya), error internal, atau
+   ditinggal pemanggil (`cancelled`, 499) — berisi provider, model, device, compute type,
+   ukuran upload, durasi audio, `wait_ms`/`validate_ms`/`transcribe_ms`/`total_ms`, dan
+   request in-flight; TTS berisi alias, panjang teks, byte output, dan waktu sintesis. Tidak
+   pernah audio, transkrip, teks, atau identifier voice penyedia. Sink default = satu baris log
+   `key=value`; sink metrik = implementasi kedua dari Protocol yang sama.
+2. **Konkurensi mesin nyata:** model faster-whisper dibuat dengan `num_workers =
+   FSA_STT_MAX_CONCURRENT`. Sebelumnya konkurensi > 1 hanya menambah antrean di dalam model.
+   Terverifikasi: dua transkripsi 57 s paralel selesai 23,3 s bersamaan (vs 20,6 s + 48,4 s
+   berurutan dengan konkurensi 1).
+3. **Pemeriksaan kesiapan saat boot** mencakup device dan compute type
+   (`ctranslate2.get_supported_compute_types`, tanpa memuat model): `cuda` tanpa GPU atau
+   `float16` di CPU tertulis di log start, bukan baru ketahuan sebagai 503.
+4. **Error mesin netral-penyedia:** pemanggil menerima `details.reason`
+   (`model_not_provisioned`, `engine_not_installed`, `engine_failed_to_load`,
+   `decoder_not_installed`); nama library, device, dan path hanya di log.
+5. **Template generik:** upstream nginx bernama (instance Speech tambahan = baris `server`),
+   dua zona `limit_req` tetap terpisah.
+
+### R.5 Temuan operasional (untuk deployment)
+
+- **Tanpa provisioning, request pertama mengunduh model** — terukur 79,7 s untuk `small`.
+  Karena itu produksi berjalan dengan `HF_HUB_OFFLINE=1` dan model diprovision lebih dulu
+  (`scripts/provision_stt_model.py`); model yang hilang → 503 `model_not_provisioned` dalam
+  ~30 ms, dan provisioning memperbaiki service yang sedang berjalan tanpa restart.
+- `WhisperModel("small")` mencoba `./small` relatif terhadap working directory lebih dulu;
+  nama model kini selalu di-resolve lewat `download_model`, hanya path absolut yang dianggap
+  direktori lokal.
+- `client_max_body_size 32m` untuk `/api/v1/speech/` (batas aplikasi 25 MB + margin multipart).
+- Rate limit in-process di role `all` tetap satu bucket bersama (keterbatasan dev);
+  pemisahan jatah di produksi = proses terpisah + zona nginx terpisah.
+
+### R.6 Status dan gerbang yang tersisa
+
+| Area | Status |
+|---|---|
+| Implementasi 1–12 | ✅ disetujui |
+| Provider nyata (faster-whisper, Edge) | ✅ terverifikasi di macOS dengan kode terbaru: nama model offline, artefak lokal int8, konkurensi 2, misconfig device/compute, ketiga alias TTS, 0 koneksi jaringan selama STT |
+| Observability, konkurensi, kesiapan boot, error netral | ✅ |
+| Dokumentasi (README, AGENTS) | ✅ |
+| Template deployment generik (`deploy/`) | ✅ |
+| Regresi Face | ✅ OpenAPI role `face` byte-identik dengan `f1f002f`; skor `buffalo_l` nyata identik base vs branch (macOS) |
+| **Kompatibilitas Linux py3.10/3.11/3.12** | ⏳ **gerbang merge yang tersisa** — `scripts/linux_validation.sh matrix` di Ubuntu 24.04 x86_64; tidak ada host Linux di sesi ini |
+
+`scripts/linux_validation.sh`:
+
+```bash
+scripts/linux_validation.sh matrix python3.10 python3.11 python3.12   # kompatibilitas (gerbang)
+scripts/linux_validation.sh benchmark python3.12                      # karakteristik, opsional
+sudo CONFIRM_THROWAWAY_HOST=yes scripts/linux_validation.sh staging   # uji template, VM buangan
+```
+
 Bila hasil Linux berbeda dengan resolver/dry-run, **hasil Linux yang berlaku**; bila dependency
 Face harus berubah, **STOP dan laporkan**.
 
-### R.5a Status langkah 13–18 (2026-09-30)
+### R.7 Karakteristik model (bukan sizing)
 
-Semua perangkat sudah ada dan terverifikasi di macOS; **belum ada satu pun angka Linux.**
-Repo ini tidak memakai GitHub Actions, jadi validasi Linux dijalankan dengan satu skrip di host
-Ubuntu 24.04 x86_64 — idealnya server Speech target atau mesin yang spesifikasinya setara:
+`scripts/benchmark_stt.py` pada korpus `scripts/build_stt_corpus.py` (FLEURS + LibriVox
+Indonesia, 19 klip suara manusia, 12 menit), `int8`, 1 thread, Apple M2 — angkanya ada di
+README ("Karakteristik model"). Akurasi berlaku lintas host; latensi dan memori milik host yang
+diukur. Tim infrastruktur menjalankan skrip yang sama di host targetnya.
 
-```bash
-scripts/linux_validation.sh matrix python3.10 python3.11 python3.12   # langkah 13
-scripts/linux_validation.sh benchmark python3.12                      # langkah 14
-sudo CONFIRM_THROWAWAY_HOST=yes BENCHMARK_JSON=validation-results/<ts>/benchmark/benchmark.json \
-    scripts/linux_validation.sh staging                               # langkah 17-18, VM buangan
-```
-
-Hasilnya ada di `validation-results/<timestamp>/` (diabaikan git) dan itulah yang dikirim balik.
-
-| Langkah | Perangkat | Status |
-|---|---|---|
-| 13 | `matrix`: per interpreter, install penuh + bukti insightface dibuild dari sdist, perbandingan versi paket per paket dengan install Face-only `f1f002f`, `pip check`, import, ruff, test Speech/Face/penuh, smoke Face nyata base-vs-feature & dua urutan import, smoke Speech nyata offline | siap; menunggu host Linux |
-| 14 | `benchmark`: korpus `scripts/build_stt_corpus.py` (FLEURS + LibriVox Indonesia, manusia nyata), `base`/`small` × 2 dan semua core, 3 run warm, plus memori Face | siap; menunggu host Linux |
-| 15C | provisioning: `scripts/provision_stt_model.py`; model hilang → 503 `model_not_provisioned` dalam ~30 ms; cek disk saat boot | ✅ (commit `eb2cd8d`) |
-| 17 | `deploy/systemd/`, `deploy/nginx/`, `deploy/env/speech.env.example` | ditulis; `MemoryMax` menunggu 14 |
-| 18 | `scripts/smoke_deploy.py` (25 cek HTTP + cek systemd/strace); `staging` men-deploy ke host sesuai README lalu menjalankannya | 25/25 hijau secara lokal tanpa nginx/systemd; menunggu VM Linux |
-
-**Aturan `MemoryMax` yang diusulkan** (dipakai mode `staging`, angka produksi diputuskan saat
-review): `MemoryMax = ceil(1,5 × puncak RSS proses terukur / 256 MiB) × 256 MiB` untuk model dan
-jumlah thread produksi. Puncak proses (`ru_maxrss`, termasuk saat load) — bukan RSS setelah
-load — karena itulah yang harus muat. Margin 1,5× menampung fragmentasi heap selama uptime,
-empat buffer TTS bersamaan (≤ 10 MB masing-masing), spooling multipart, dan arena glibc per
-thread; tetap cukup ketat untuk membunuh kebocoran sungguhan jauh sebelum menekan Face.
-`MemoryHigh` sengaja tidak dipakai: working set Speech hampir seluruhnya bobot model, jadi
-throttling reclaim hanya berarti latensi melonjak tanpa ada yang bisa dilepas.
-
-### R.6 Prosedur benchmark (langkah 14)
-
-Di host target, satu worker, `FSA_STT_MAX_CONCURRENT=1`:
-
-```bash
-.venv/bin/python scripts/benchmark_stt.py samples/ \
-    --models base small medium --model-root /var/lib/fsa/models \
-    --cpu-threads 2 --language id --show-text \
-    --output benchmark.md --json benchmark.json
-```
-
-`samples/` berisi satu folder per kategori (nama folder = kategori), tiap audio boleh punya
-`<nama>.txt` berisi ucapan sebenarnya. Kategori minimal: Indonesia jelas, percakapan, pria,
-wanita, tenang, bising ringan, pendek, panjang — **rekaman nyata**, bukan hasil TTS (audio TTS
-terlalu mudah; uji coba alat dengan TTS memberi WER 0,0). Tiap model dijalankan di interpreter
-baru (RSS bersih), diunduh dulu lalu diukur dengan `HF_HUB_OFFLINE=1`. Laporan berisi RSS idle /
-model termuat / puncak / sesudah, RTF, WER, dan **biaya terfit `tetap + per-detik`** yang
-memprediksi durasi satu klip sepanjang `FSA_STT_MAX_AUDIO_SECONDS` terhadap budget 120 s.
-Pilih model terkecil yang kualitas transkripnya dapat diterima bisnis (baca transkripnya, WER
-menghukum "8" vs "delapan"); `MemoryMax` = peak RSS model itu + headroom operasional.
+---
 
 Revisi 2 menggabungkan architecture decision dari pemilik sistem (Prompt 2) dan hasil
 verifikasi dependency yang benar-benar dijalankan, bukan diasumsikan. Perubahan terbesar dari
