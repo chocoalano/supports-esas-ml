@@ -17,8 +17,11 @@
 #              suites, the real Face smoke (base against feature, both import
 #              orders) and the offline real Speech smoke. Changes nothing
 #              outside $WORK and the download caches.
-#   benchmark  base and small, int8, on real Indonesian speech, at 2 threads
-#              and at every core; memory, CPU, latency model, WER/CER.
+#   benchmark  base and small, int8, on real Indonesian speech, at every core
+#              (and 2 threads when there are more); memory, CPU, latency
+#              model, WER/CER. FACE_MEMORY=1 also measures buffalo_l. Run it on
+#              a spare VM of the production instance type, not on the live
+#              server: it saturates the CPU and loads a model of its own.
 #   staging    DEPLOYS ONTO THIS HOST as the README documents - user faceapi,
 #              /opt/face-api, both systemd units, nginx - then runs
 #              scripts/smoke_deploy.py --systemd. For a throwaway VM only.
@@ -225,7 +228,10 @@ run_benchmark() {
     "$venv/bin/pip" install -q --upgrade pip "cython<3.1" "numpy<2.3"
     "$venv/bin/pip" install -q -r requirements-dev.txt
     corpus "$venv/bin/python"
-    local threads="2"
+    # Thread counts the host can actually run: every core, and 2 when there
+    # are more than 2. On a 1 vCPU host that is 1 - benchmarking 2 threads on
+    # one core measures contention, not the model.
+    local threads="$(nproc)"
     [ "$(nproc)" -gt 2 ] && threads="2 $(nproc)"
     log "benchmark: ${MODELS:-base small}, int8, threads $threads"
     # shellcheck disable=SC2086  # word splitting of the two lists is intended
@@ -233,8 +239,13 @@ run_benchmark() {
         --models ${MODELS:-base small} --cpu-threads $threads --compute-type int8 \
         --model-root "$STT_MODEL_ROOT" --language id --repeat "${REPEAT:-3}" --show-text \
         --output "$out/benchmark.md" --json "$out/benchmark.json"
-    log "benchmark: Face memory (real buffalo_l)"
-    PYTHONPATH="$REPO" "$venv/bin/python" scripts/smoke_face.py --output "$out/face-memory.json" > /dev/null
+    # Loads buffalo_l (~700 MB). Opt-in: on a small host already running the
+    # Face service, a second copy of the model is how the OOM killer gets
+    # involved.
+    if [ "${FACE_MEMORY:-0}" = "1" ]; then
+        log "benchmark: Face memory (real buffalo_l)"
+        PYTHONPATH="$REPO" "$venv/bin/python" scripts/smoke_face.py --output "$out/face-memory.json" > /dev/null
+    fi
 }
 
 run_staging() {
