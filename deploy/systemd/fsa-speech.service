@@ -1,17 +1,21 @@
 # Speech runtime: /speech/* only. Same code and venv as fsa-face, its own process.
 #
 #   /etc/systemd/system/fsa-speech.service
-#   /etc/systemd/system/fsa-speech.service.d/memory.conf   <- MemoryMax, from the benchmark
 #
-# Why a second process rather than a router in the first: an OOM, a crash or a
-# stalled provider here ends here. Face does not share its memory, its CPU
-# share, its rate budget, or - since PyAV and OpenCV each bring their own
-# FFmpeg - its address space.
+# A second process rather than a second router in the first: failures, scaling,
+# deployment, concurrency, rate limits, logs - and the native libraries, since
+# PyAV and OpenCV each bring their own FFmpeg - stay apart from Face. The same
+# unit runs one instance on the Face host, or many instances on hosts of their
+# own behind a load balancer; nothing in the application changes.
+#
+# Sizing - worker processes, memory and CPU limits - is a deployment decision
+# made for the hardware at hand. None of it lives here: see speech.env for the
+# worker count and fsa-speech.service.d/limits.conf.example for optional limits.
 [Unit]
 Description=Face Similarity API - Speech runtime (STT + TTS)
 After=network-online.target
 Wants=network-online.target
-# A crash loop is reported, not hidden: at most 5 starts in 5 minutes.
+# A crash loop is reported, not hidden.
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
@@ -23,6 +27,7 @@ Group=faceapi
 # the working directory, and the Face runtime's `.env` must not leak into this
 # one. The code is found through --app-dir instead.
 WorkingDirectory=/opt/face-api/speech
+# Holds the Speech settings and WEB_CONCURRENCY, uvicorn's worker count.
 EnvironmentFile=/opt/face-api/speech.env
 Environment=FSA_RUNTIME_ROLE=speech
 Environment=FSA_STT_ENABLED=true
@@ -30,16 +35,12 @@ Environment=FSA_TTS_ENABLED=true
 # The model is provisioned before start (scripts/provision_stt_model.py); this
 # process never downloads. A missing model is a fast 503, not a network wait.
 Environment=HF_HUB_OFFLINE=1
+# No --workers: uvicorn takes WEB_CONCURRENCY from the environment (default 1).
 ExecStart=/opt/face-api/venv/bin/uvicorn app.main:app --app-dir /opt/face-api/app \
-    --host 127.0.0.1 --port 8002 --workers 1 --timeout-keep-alive 65
+    --host 127.0.0.1 --port 8002 --timeout-keep-alive 65
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=60
-
-# Resources. MemoryMax lives in memory.conf, next to the numbers it came from.
-# Under CPU contention Face gets twice Speech's share; with no contention
-# Speech still uses whatever is idle. A weight, not a quota, for that reason.
-CPUWeight=50
 
 NoNewPrivileges=true
 PrivateTmp=true

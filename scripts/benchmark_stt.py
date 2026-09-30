@@ -1,8 +1,9 @@
-"""Benchmark speech-to-text models on the host that will run them.
+"""Measure what a speech-to-text model costs and how well it transcribes, on this host.
 
-Measures what choosing FSA_STT_MODEL, FSA_STT_MAX_AUDIO_SECONDS and MemoryMax
-depends on, through this service's own code - the audio validator and
-`FasterWhisperEngine`, exactly as a request runs them:
+Software characteristics, per model and configuration - the data a deployment
+sizes itself from, not a sizing decision. Measured through this service's own
+code - the audio validator and `FasterWhisperEngine`, exactly as a request
+runs them:
 
 - model load time, the first (cold) transcription, then N warm repetitions;
 - latency modelled as `fixed + per_audio_second x duration`, fitted on warm
@@ -22,8 +23,8 @@ Samples: one folder per category, audio inside, and for any file an optional
         --models base small --cpu-threads 2 4 --model-root /var/lib/fsa/models \\
         --language id --repeat 3 --output benchmark.md --json benchmark.json
 
-Numbers from any machine other than the production host are not production
-latency. Memory transfers better than latency, but only between like builds.
+Latency belongs to the host it was measured on. Accuracy does not: the same
+model and compute type produce the same transcript on any CPU.
 """
 
 from __future__ import annotations
@@ -280,7 +281,7 @@ def run_worker(args: argparse.Namespace) -> None:
     report["samples"] = results
     report["peak_rss_transcribing_mb"] = max(result["peak_rss_mb"] for result in results)
     report["rss_after_mb"] = round(rss_mb(), 1)
-    # The whole life of the process, load included: what MemoryMax must hold.
+    # The whole life of the process, load included - not only while transcribing.
     report["rss_process_peak_mb"] = round(peak_rss_mb(), 1)
     print(json.dumps(report))
 
@@ -355,7 +356,7 @@ def render(reports: list[dict], args: argparse.Namespace, machine: dict) -> str:
     lines += [f"- {key}: `{value}`" for key, value in machine.items()]
     lines += [
         f"- beam_size={args.beam_size}, language={args.language or 'detect'}, concurrency=1, "
-        f"warm repetitions={args.repeat}, gateway budget={args.gateway_timeout:g}s, "
+        f"warm repetitions={args.repeat}, "
         f"FSA_STT_MAX_AUDIO_SECONDS={args.max_audio_seconds:g}",
         "",
         "## Summary",
@@ -371,9 +372,7 @@ def render(reports: list[dict], args: argparse.Namespace, machine: dict) -> str:
         fixed, per_second = cost if cost else (None, None)
         at_cap = "-"
         if cost:
-            predicted = fixed + per_second * args.max_audio_seconds
-            verdict = "OK" if predicted < args.gateway_timeout else "OVER"
-            at_cap = f"{predicted:.0f}s {verdict}"
+            at_cap = f"{fixed + per_second * args.max_audio_seconds:.0f}s"
         peak_cores = max((s["peak_cpu_cores"] or 0) for s in samples)
         lines.append(
             f"| {report['model']} | {report['cpu_threads']} | {report['load_seconds']} "
@@ -386,8 +385,8 @@ def render(reports: list[dict], args: argparse.Namespace, machine: dict) -> str:
 
     lines += [
         "",
-        "`at cap` = fitted cost of one clip of FSA_STT_MAX_AUDIO_SECONDS. OVER: the gateway",
-        "gives up first - lower the cap, fix CPU, or change model, before any timeout is raised.",
+        "`at cap` = predicted time for one clip of FSA_STT_MAX_AUDIO_SECONDS on this host,",
+        "from the fitted `fixed + per audio second` cost.",
         "",
         "## Latency model: observed against predicted (warm medians)",
         "",
@@ -457,7 +456,6 @@ def main() -> None:
     parser.add_argument("--language", default=None)
     parser.add_argument("--repeat", type=int, default=3, help="Warm runs per clip.")
     parser.add_argument("--max-audio-seconds", type=float, default=300.0)
-    parser.add_argument("--gateway-timeout", type=float, default=120.0)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--json", type=Path, help="Also write the raw measurements here.")
     parser.add_argument("--show-text", action="store_true", help="Include transcripts.")

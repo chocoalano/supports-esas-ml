@@ -1,0 +1,20 @@
+# OPTIONAL deployment tuning - an example, not an application requirement.
+#
+#   /etc/systemd/system/fsa-speech.service.d/limits.conf
+#
+# The application sets no resource limits and assumes no hardware. Whether to
+# cap the Speech runtime, and at what, depends on the host it shares (or does
+# not share) and on the model, compute type, FSA_STT_MAX_CONCURRENT and
+# WEB_CONCURRENCY chosen for it. Measure first - scripts/benchmark_stt.py
+# reports load time, latency and resident memory per model on the host it runs
+# on - then uncomment what the deployment needs.
+[Service]
+# Hard memory ceiling for the whole unit (all uvicorn workers together).
+#MemoryMax=<measured peak x workers + headroom>
+
+# Relative CPU share under contention (default 100). Lower than the Face unit's
+# on a shared host if Face should win; irrelevant on a dedicated Speech host.
+#CPUWeight=<n>
+
+# Which process the kernel's OOM killer prefers on a host that runs out.
+#OOMScoreAdjust=<n>

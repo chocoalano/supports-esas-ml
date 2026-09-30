@@ -25,7 +25,7 @@
 #   staging    DEPLOYS ONTO THIS HOST as the README documents - user faceapi,
 #              /opt/face-api, both systemd units, nginx - then runs
 #              scripts/smoke_deploy.py --systemd. For a throwaway VM only.
-#              Needs a benchmark run first: MemoryMax is computed from it.
+#              Validates the templates as shipped: no resource limits applied.
 #
 # Python 3.10 and 3.11 on Ubuntu 24.04 come from the deadsnakes PPA:
 #   sudo add-apt-repository ppa:deadsnakes/ppa
@@ -255,8 +255,7 @@ run_staging() {
         echo "Run it on a throwaway VM with CONFIRM_THROWAWAY_HOST=yes."
         exit 1
     }
-    local bench="${BENCHMARK_JSON:-}" model="${STAGED_MODEL:-small}" key out="$RESULTS/staging"
-    [ -n "$bench" ] && [ -f "$bench" ] || { echo "set BENCHMARK_JSON=<benchmark/benchmark.json>"; exit 1; }
+    local model="${STAGED_MODEL:-small}" key out="$RESULTS/staging"
     key="staging-$(python3 -c 'import secrets; print(secrets.token_urlsafe(16))')"
     mkdir -p "$out"
 
@@ -293,18 +292,8 @@ allowed_modules=['detection','recognition','landmark_3d_68']).prepare(ctx_id=-1)
     (cd /opt/face-api/app && sudo -u faceapi /opt/face-api/venv/bin/python \
         scripts/provision_stt_model.py --env-file /opt/face-api/speech.env) | tee "$out/provision.json"
 
-    log "staging: systemd, MemoryMax from $bench"
-    STAGED_MODEL="$model" python3 - "$bench" <<'EOF' | tee "$out/memory.conf"
-import json, math, os, sys
-reports = json.load(open(sys.argv[1]))["reports"]
-peak = max(r["rss_process_peak_mb"] for r in reports if r["model"] == os.environ["STAGED_MODEL"])
-print("[Service]")
-print(f"# 1.5 x measured process peak {peak:.0f} MB, rounded up to 256 MiB")
-print(f"MemoryMax={math.ceil(peak * 1.5 / 256) * 256}M")
-EOF
+    log "staging: systemd units as shipped"
     cp deploy/systemd/fsa-face.service deploy/systemd/fsa-speech.service /etc/systemd/system/
-    mkdir -p /etc/systemd/system/fsa-speech.service.d
-    cp "$out/memory.conf" /etc/systemd/system/fsa-speech.service.d/memory.conf
     systemd-analyze verify /etc/systemd/system/fsa-face.service /etc/systemd/system/fsa-speech.service
     systemctl daemon-reload
     systemctl enable --now fsa-face fsa-speech

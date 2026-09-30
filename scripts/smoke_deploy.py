@@ -39,6 +39,11 @@ class Checks:
         self.results[name] = {"ok": bool(ok), **detail}
         print(f"{'PASS' if ok else 'FAIL'}  {name}  {detail if not ok else ''}", flush=True)
 
+    def info(self, name: str, value: object) -> None:
+        """Recorded, never judged."""
+        self.results[name] = {"ok": True, "info": value}
+        print(f"INFO  {name}  {value}", flush=True)
+
     @property
     def failed(self) -> list[str]:
         return [name for name, result in self.results.items() if not result["ok"]]
@@ -297,13 +302,13 @@ def systemd_checks(checks: Checks, verify_face, transcribe, wav: bytes) -> None:
             time.sleep(1)
         return False
 
-    memory_max = show("fsa-speech", "MemoryMax")
-    checks.record(
-        "speech_memory_max_set", memory_max not in ("", "infinity"), memory_max=memory_max
-    )
+    # Resource limits are a deployment's choice, not something to pass or
+    # fail: reported so the result says what was running.
+    for prop in ("MemoryMax", "CPUWeight", "OOMScoreAdjust"):
+        checks.info(f"speech_{prop}", show("fsa-speech", prop))
     environment = show("fsa-speech", "Environment")
     checks.record("speech_offline_mode", "HF_HUB_OFFLINE=1" in environment)
-    checks.record("speech_cpu_weight_below_face", show("fsa-speech", "CPUWeight") == "50")
+    checks.record("speech_role_pinned_by_unit", "FSA_RUNTIME_ROLE=speech" in environment)
 
     # Face latency before, Speech stopped, Speech restarted, Face latency after.
     before = [verify_face()[1] for _ in range(5)]

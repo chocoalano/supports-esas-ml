@@ -1,7 +1,11 @@
 # Face runtime: /face/* and /liveness/*. Identical to the face-api.service the
-# README has always documented, with the runtime role made explicit.
+# README has always documented, with the runtime role made explicit. Adding
+# Speech changes nothing else about how Face runs.
 #
 #   /etc/systemd/system/fsa-face.service
+#
+# `--workers 2` is the README's existing example, not a requirement: worker
+# count is sized per deployment (see README, "Jumlah worker").
 [Unit]
 Description=Face Similarity API - Face runtime (Face + Liveness)
 After=network.target
