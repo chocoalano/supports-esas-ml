@@ -1,0 +1,252 @@
+# Linux validation for the Speech module: the merge gate, not a deployment.
+#
+# Nothing here deploys, publishes a package, or touches a server. It installs
+# the full requirements on Ubuntu 24.04 x86_64 for every supported Python,
+# proves the Face stack did not move, runs the suites and real smoke tests
+# (real buffalo_l, real faster-whisper, real Edge TTS), benchmarks STT, and
+# commits the measurements to the `ci/speech-validation-results` branch.
+name: speech-validation
+
+on:
+  push:
+    branches: [feature/speech-module]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: speech-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BASE_COMMIT: f1f002f
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  matrix:
+    name: ubuntu-24.04 / python ${{ matrix.python }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12"]
+    env:
+      OUT: ${{ github.workspace }}/out/python-${{ matrix.python }}
+      # Every install builds for real: a cached wheel would hide whether
+      # insightface still compiles from its sdist on this interpreter.
+      PIP_NO_CACHE_DIR: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install the full requirements (make install)
+        run: |
+          mkdir -p "$OUT"
+          make install PY="$(command -v python)" 2>&1 | tee "$OUT/install.log"
+          # insightface 0.7.3 ships only an sdist: it must have been compiled here.
+          grep -E "Building wheel for insightface" "$OUT/install.log"
+          .venv/bin/pip freeze > "$OUT/freeze-feature.txt"
+
+      - name: Install the Face-only requirements of the base commit
+        run: |
+          mkdir -p /tmp/base-requirements
+          git show "$BASE_COMMIT:requirements.txt" > /tmp/base-requirements/requirements.txt
+          git show "$BASE_COMMIT:requirements-dev.txt" > /tmp/base-requirements/requirements-dev.txt
+          python -m venv /tmp/base-venv
+          /tmp/base-venv/bin/pip install --upgrade pip "cython<3.1" "numpy<2.3"
+          /tmp/base-venv/bin/pip install -r /tmp/base-requirements/requirements-dev.txt
+          /tmp/base-venv/bin/pip freeze > "$OUT/freeze-base.txt"
+
+      - name: No dependency drift - every base package at the same version
+        run: |
+          python - "$OUT" <<'EOF'
+          import json, sys
+          out = sys.argv[1]
+          def read(name):
+              pins = {}
+              for line in open(f"{out}/{name}"):
+                  if "==" in line:
+                      package, version = line.strip().split("==", 1)
+                      pins[package.lower().replace("_", "-")] = version
+              return pins
+          base, feature = read("freeze-base.txt"), read("freeze-feature.txt")
+          drift = {p: [v, feature.get(p)] for p, v in base.items() if feature.get(p) != v}
+          added = sorted(set(feature) - set(base))
+          json.dump({"drift": drift, "added_by_speech": added}, open(f"{out}/drift.json", "w"), indent=2)
+          print(json.dumps({"drift": drift, "added_by_speech": added}, indent=2))
+          sys.exit(1 if drift else 0)
+          EOF
+
+      - name: pip check, imports, versions
+        run: |
+          .venv/bin/pip check | tee "$OUT/pip-check.txt"
+          .venv/bin/python - <<'EOF' | tee "$OUT/versions.json"
+          import json, platform
+          from importlib.metadata import version
+          import av, cv2, edge_tts, faster_whisper, insightface, onnxruntime  # noqa: F401
+          packages = [
+              "numpy", "onnxruntime", "opencv-python-headless", "insightface", "av",
+              "faster-whisper", "ctranslate2", "edge-tts", "huggingface-hub", "tokenizers",
+              "fastapi", "starlette", "pydantic", "pydantic-settings", "uvicorn", "anyio",
+          ]
+          print(json.dumps({
+              "python": platform.python_version(),
+              "platform": platform.platform(),
+              "machine": platform.machine(),
+              **{name: version(name) for name in packages},
+          }, indent=2))
+          EOF
+
+      - name: ruff
+        run: make lint 2>&1 | tee "$OUT/ruff.txt"
+
+      - name: pytest - targeted Speech
+        run: |
+          .venv/bin/python -m pytest -p no:cacheprovider tests/test_speech_*.py \
+            tests/test_audio_validation.py 2>&1 | tee "$OUT/pytest-speech.txt"
+
+      - name: pytest - existing Face suites
+        run: |
+          .venv/bin/python -m pytest -p no:cacheprovider tests/test_access.py \
+            tests/test_challenge.py tests/test_liveness.py tests/test_scoring.py \
+            tests/test_settings.py tests/test_verify.py tests/test_verify_image.py \
+            tests/test_video_sampler.py 2>&1 | tee "$OUT/pytest-face.txt"
+
+      - name: pytest - full (make test)
+        run: make test 2>&1 | tee "$OUT/pytest-full.txt"
+
+      - name: Face smoke - real buffalo_l, base against feature, both import orders
+        run: |
+          git worktree add /tmp/base-tree "$BASE_COMMIT"
+          PYTHONPATH=/tmp/base-tree .venv/bin/python scripts/smoke_face.py --output "$OUT/face-base.json"
+          PYTHONPATH=. .venv/bin/python scripts/smoke_face.py --output "$OUT/face-feature.json"
+          PYTHONPATH=. .venv/bin/python scripts/smoke_face.py --preimport av --output "$OUT/face-feature-av-first.json"
+          python - "$OUT" <<'EOF'
+          import json, sys
+          out = sys.argv[1]
+          base, feature, av_first = (
+              json.load(open(f"{out}/{name}.json"))["cases"]
+              for name in ("face-base", "face-feature", "face-feature-av-first")
+          )
+          verdict = {"base_equals_feature": base == feature, "av_first_equals_feature": av_first == feature}
+          json.dump(verdict, open(f"{out}/face-regression.json", "w"), indent=2)
+          print(verdict)
+          sys.exit(0 if all(verdict.values()) else 1)
+          EOF
+
+      - name: Cache the benchmark corpus sources
+        uses: actions/cache@v6
+        with:
+          path: .corpus-cache
+          key: stt-corpus-sources-v1
+
+      - name: Speech smoke - provisioned model, offline, real providers
+        run: |
+          .venv/bin/python scripts/build_stt_corpus.py "$RUNNER_TEMP/corpus" --cache .corpus-cache > "$OUT/corpus.txt"
+          cat > "$RUNNER_TEMP/speech.env" <<EOF
+          FSA_STT_ENABLED=true
+          FSA_STT_MODEL=small
+          FSA_STT_COMPUTE_TYPE=int8
+          FSA_STT_MODEL_ROOT=$RUNNER_TEMP/models
+          FSA_STT_DEFAULT_LANGUAGE=id
+          EOF
+          .venv/bin/python scripts/provision_stt_model.py --env-file "$RUNNER_TEMP/speech.env" \
+            | tee "$OUT/provision.json"
+          HF_HUB_OFFLINE=1 FSA_STT_MODEL=small FSA_STT_MODEL_ROOT="$RUNNER_TEMP/models" \
+            .venv/bin/python scripts/smoke_speech.py \
+            --audio "$RUNNER_TEMP/corpus/pendek_pria/02.wav" \
+            --reference "$RUNNER_TEMP/corpus/pendek_pria/02.txt" \
+            --output "$OUT/speech-smoke.json"
+
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: matrix-python-${{ matrix.python }}
+          path: out/
+          if-no-files-found: warn
+
+  benchmark:
+    name: STT benchmark (ubuntu-24.04, python 3.12)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      OUT: ${{ github.workspace }}/out/benchmark
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: make install PY="$(command -v python)" > /dev/null
+
+      - name: Cache the benchmark corpus sources
+        uses: actions/cache@v6
+        with:
+          path: .corpus-cache
+          key: stt-corpus-sources-v1
+
+      - name: Build the corpus
+        run: |
+          mkdir -p "$OUT"
+          .venv/bin/python scripts/build_stt_corpus.py "$RUNNER_TEMP/corpus" --cache .corpus-cache \
+            | tee "$OUT/corpus.txt"
+          cp "$RUNNER_TEMP/corpus/manifest.json" "$OUT/corpus-manifest.json"
+
+      - name: Benchmark base and small, int8, 2 and 4 threads
+        run: |
+          .venv/bin/python scripts/benchmark_stt.py "$RUNNER_TEMP/corpus" \
+            --models base small --cpu-threads 2 4 --compute-type int8 \
+            --model-root "$RUNNER_TEMP/models" --language id --repeat 3 --show-text \
+            --output "$OUT/benchmark.md" --json "$OUT/benchmark.json"
+          cat "$OUT/benchmark.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark
+          path: out/
+          if-no-files-found: warn
+
+  publish:
+    name: Commit the measurements to ci/speech-validation-results
+    needs: [matrix, benchmark]
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Commit
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN: ${{ github.run_id }}-${{ github.run_attempt }}
+          SHA: ${{ github.sha }}
+          RESULTS: matrix=${{ needs.matrix.result }} benchmark=${{ needs.benchmark.result }}
+        run: |
+          git init -q results && cd results
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git fetch -q origin ci/speech-validation-results; then
+            git checkout -q -b results FETCH_HEAD
+          else
+            git checkout -q --orphan results
+          fi
+          mkdir -p "runs/$RUN"
+          cp -r ../artifacts/. "runs/$RUN/"
+          printf 'commit %s\n%s\n' "$SHA" "$RESULTS" > "runs/$RUN/RUN.txt"
+          git add runs
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "speech-validation $RUN for $SHA ($RESULTS)"
+          git push -q origin HEAD:ci/speech-validation-results
